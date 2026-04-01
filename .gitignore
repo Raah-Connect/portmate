@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Logs
 logs
 *.log
@@ -22,3 +23,22 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+=======
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# Tauri
+src-tauri/gen/android/
+src-tauri/gen/apple/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+>>>>>>> b4b176649e9bc8ea8e1177968d4e2e0c80b889e0
