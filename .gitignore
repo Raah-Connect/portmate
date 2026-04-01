@@ -1,0 +1,17 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# Tauri
+src-tauri/gen/android/
+src-tauri/gen/apple/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
