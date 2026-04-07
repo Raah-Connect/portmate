@@ -8,10 +8,11 @@ import { TerminalOutput } from "./TerminalOutput";
 type Step = "welcome" | "setup" | "download" | "boot";
 
 interface PlatformInfo { os: string; arch: string; supported: boolean; }
+interface Props { onComplete?: () => void; }
 
 const STEPS: Step[] = ["welcome", "setup", "download", "boot"];
 
-export function BootWizard() {
+export function BootWizard({ onComplete }: Props) {
   const [step, setStep]               = useState<Step>("welcome");
   const [platform, setPlatform]       = useState<PlatformInfo | null>(null);
   const [pierDir, setPierDir]         = useState("");
@@ -24,7 +25,7 @@ export function BootWizard() {
   const [shipUrl, setShipUrl]         = useState("");
   const [accessCode, setAccessCode]   = useState("");
   const [error, setError]             = useState("");
-
+  
   useEffect(() => {
     invoke<PlatformInfo>("get_platform_info").then(setPlatform);
 
@@ -243,7 +244,7 @@ export function BootWizard() {
                 </p>
               )}
               <button
-                onClick={() => openUrl(shipUrl)}
+                onClick={() => { openUrl(shipUrl); onComplete?.(); }}
                 style={{ ...btnStyle, marginTop: 12 }}
               >
                 Open Landscape →
