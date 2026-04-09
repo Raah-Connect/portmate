@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { TerminalOutput } from "./TerminalOutput";
+import { MemoryManager } from "./MemoryManager";
 
 export interface ShipInfo {
   name: string;
@@ -20,10 +21,16 @@ interface Props {
   onDelete: () => void;
 }
 
+type Panel = "terminal" | "memory";
+
 export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
-  const [expanded, setExpanded]     = useState(false);
-  const [codeCopied, setCodeCopied] = useState(false);
-  const [confirming, setConfirming] = useState<"stop" | "delete" | null>(null);
+  const [activePanel, setActivePanel] = useState<Panel | null>(null);
+  const [codeCopied, setCodeCopied]   = useState(false);
+  const [confirming, setConfirming]   = useState<"stop" | "delete" | null>(null);
+
+  function togglePanel(panel: Panel) {
+    setActivePanel(prev => prev === panel ? null : panel);
+  }
 
   function copyCode() {
     if (!ship.accessCode) return;
@@ -70,50 +77,60 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
             </div>
           </div>
         </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 12, color: statusColor, fontWeight: 600 }}>
-            {statusLabel}
-          </span>
-          <button
-            onClick={() => setExpanded(e => !e)}
-            style={iconBtnStyle}
-            title={expanded ? "Collapse" : "Expand"}
-          >
-            {expanded ? "▲" : "▼"}
-          </button>
-        </div>
+        <span style={{ fontSize: 12, color: statusColor, fontWeight: 600 }}>
+          {statusLabel}
+        </span>
       </div>
 
-     {/* ── Info Row ── */}
-            <div style={infoRowStyle}>
-            {ship.url ? (
-                <button onClick={() => openUrl(ship.url)} style={landscapeBtnStyle}>
-                Open Landscape →
-                </button>
-            ) : (
-                <span style={{ fontSize: 12, color: "#475569" }}>
-                {ship.status === "booting" ? "Waiting for web interface…" : "Not running"}
-                </span>
-            )}
+      {/* ── Info Row ── */}
+      <div style={infoRowStyle}>
+        {ship.url ? (
+          <button onClick={() => openUrl(ship.url)} style={landscapeBtnStyle}>
+            Open Landscape →
+          </button>
+        ) : (
+          <span style={{ fontSize: 12, color: "#475569" }}>
+            {ship.status === "booting" ? "Waiting for web interface…" : "Not running"}
+          </span>
+        )}
+        <button
+          onClick={copyCode}
+          style={ship.accessCode ? codeBtnStyle : codeEmptyBtnStyle}
+          title={ship.accessCode ? "Click to copy access code" : "Access code not yet available"}
+          disabled={!ship.accessCode}
+        >
+          <span style={{ fontFamily: "monospace", fontSize: 12 }}>
+            {codeCopied ? ship.accessCode : "🔑 Access Code"}
+          </span>
+        </button>
+      </div>
 
-            <button
-                onClick={copyCode}
-                style={ship.accessCode ? codeBtnStyle : codeEmptyBtnStyle}
-                title={ship.accessCode ? "Click to copy access code" : "Access code not yet available"}
-                disabled={!ship.accessCode}
-            >
-                <span style={{ fontFamily: "monospace", fontSize: 12 }}>
-                {codeCopied ? ship.accessCode : "🔑 Access Code"}
-                </span>
-            </button>
-            </div>
+      {/* ── Tab Bar ── */}
+      <div style={tabBarStyle}>
+        <button
+          onClick={() => togglePanel("terminal")}
+          style={tabBtnStyle(activePanel === "terminal")}
+        >
+          Terminal {activePanel === "terminal" ? "▲" : "▼"}
+        </button>
+        <button
+          onClick={() => togglePanel("memory")}
+          style={tabBtnStyle(activePanel === "memory", "#818cf8", "#1e1b4b", "#312e81")}
+        >
+          Memory {activePanel === "memory" ? "▲" : "▼"}
+        </button>
+      </div>
 
-      {/* ── Terminal (expanded) ── */}
-      {expanded && (
-        <div style={{ padding: "0 16px 12px" }}>
+      {/* ── Panel: Terminal ── */}
+      {activePanel === "terminal" && (
+        <div style={panelStyle}>
           <TerminalOutput logs={logs} />
         </div>
+      )}
+
+      {/* ── Panel: Memory ── */}
+      {activePanel === "memory" && (
+        <MemoryManager ship={ship} onRestart={onRestart} />
       )}
 
       {/* ── Actions ── */}
@@ -126,20 +143,17 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
             {confirming === "stop" ? "Click again to stop" : "Stop"}
           </button>
         )}
-
         {ship.status === "stopped" && (
           <button onClick={onRestart} style={actionBtnStyle}>
             Restart
           </button>
         )}
-
         <button
           onClick={() => confirmThen("delete")}
           style={confirming === "delete" ? dangerActiveBtnStyle : ghostBtnStyle}
         >
           {confirming === "delete" ? "Click again to delete" : "Delete pier"}
         </button>
-
         {ship.pid && (
           <span style={{ fontSize: 11, color: "#475569", marginLeft: "auto" }}>
             PID {ship.pid}
@@ -177,6 +191,39 @@ const infoRowStyle: React.CSSProperties = {
   minHeight: 44,
 };
 
+const tabBarStyle: React.CSSProperties = {
+  display: "flex",
+  gap: 6,
+  padding: "8px 16px",
+  borderBottom: "1px solid #1e293b",
+  background: "#080d16",
+};
+
+function tabBtnStyle(
+  active: boolean,
+  activeColor  = "#94a3b8",
+  activeBg     = "#1e293b",
+  activeBorder = "#334155",
+): React.CSSProperties {
+  return {
+    background:   active ? activeBg      : "transparent",
+    color:        active ? activeColor   : "#475569",
+    border:       `1px solid ${active ? activeBorder : "transparent"}`,
+    borderRadius: 6,
+    padding:      "5px 12px",
+    fontSize:     11,
+    fontWeight:   600,
+    cursor:       "pointer",
+    fontFamily:   "inherit",
+    transition:   "background 0.15s, color 0.15s",
+  };
+}
+
+const panelStyle: React.CSSProperties = {
+  padding: "12px 16px",
+  borderBottom: "1px solid #1e293b",
+};
+
 const actionsStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
@@ -203,6 +250,12 @@ const codeBtnStyle: React.CSSProperties = {
   padding: "5px 10px",
   cursor: "pointer",
   marginLeft: "auto",
+};
+
+const codeEmptyBtnStyle: React.CSSProperties = {
+  ...codeBtnStyle,
+  opacity: 0.4,
+  cursor: "not-allowed",
 };
 
 const actionBtnStyle: React.CSSProperties = {
@@ -232,19 +285,4 @@ const ghostBtnStyle: React.CSSProperties = {
   background: "transparent",
   color: "#475569",
   borderColor: "transparent",
-};
-
-const iconBtnStyle: React.CSSProperties = {
-  background: "transparent",
-  border: "none",
-  color: "#475569",
-  cursor: "pointer",
-  fontSize: 10,
-  padding: "4px 6px",
-};
-
-const codeEmptyBtnStyle: React.CSSProperties = {
-  ...codeBtnStyle,
-  opacity: 0.4,
-  cursor: "not-allowed",
 };

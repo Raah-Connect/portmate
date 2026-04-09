@@ -59,7 +59,7 @@ function App() {
     <div className="app-container">
       <header className="app-header">
         <div className="header-left">
-          <h1>🏴‍☠️ Portmate</h1>
+          <h1> Portmate</h1>
           <span className="ship-count">{ships.length} ship{ships.length !== 1 ? "s" : ""}</span>
         </div>
         <button className="boot-button" onClick={() => setShowWizard(true)}>
