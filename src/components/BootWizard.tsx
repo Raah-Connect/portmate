@@ -5,12 +5,12 @@ import { open }    from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { TerminalOutput } from "./TerminalOutput";
 
-type Step = "welcome" | "setup" | "download" | "boot";
+type Step = "welcome" | "setup" | "download" | "boot" | "existing";
 
 interface PlatformInfo { os: string; arch: string; supported: boolean; }
 interface Props { onComplete?: () => void; }
 
-const STEPS: Step[] = ["welcome", "setup", "download", "boot"];
+const NEW_SHIP_STEPS: Step[] = ["welcome", "setup", "download", "boot"];
 
 export function BootWizard({ onComplete }: Props) {
   const [step, setStep]               = useState<Step>("welcome");
@@ -25,7 +25,14 @@ export function BootWizard({ onComplete }: Props) {
   const [shipUrl, setShipUrl]         = useState("");
   const [accessCode, setAccessCode]   = useState("");
   const [error, setError]             = useState("");
-  
+
+  // Existing ship state
+  const [existingPierPath, setExistingPierPath] = useState("");
+  const [existingBooting, setExistingBooting]   = useState(false);
+  const [existingShipUrl, setExistingShipUrl]   = useState("");
+  const [existingAccessCode, setExistingAccessCode] = useState("");
+  const [existingLogs, setExistingLogs]         = useState<string[]>([]);
+
   useEffect(() => {
     invoke<PlatformInfo>("get_platform_info").then(setPlatform);
 
@@ -33,22 +40,37 @@ export function BootWizard({ onComplete }: Props) {
       listen<{ percent: number }>("download-progress", e =>
         setProgress(Math.round(e.payload.percent))
       ),
-      listen<{ line: string }>("ship-log", e =>
-        setLogs(prev => [...prev.slice(-300), e.payload.line])
-      ),
-      listen<{ url: string }>("ship-ready", e =>
-        setShipUrl(e.payload.url)
-      ),
-      listen<{ code: string }>("ship-code", e =>
-        setAccessCode(e.payload.code)
-      ),
+      listen<{ line: string; pier_path?: string }>("ship-log", e => {
+        // Route logs to the correct terminal based on pier_path
+        if (existingPierPath && e.payload.pier_path === existingPierPath) {
+          setExistingLogs(prev => [...prev.slice(-300), e.payload.line]);
+        } else {
+          setLogs(prev => [...prev.slice(-300), e.payload.line]);
+        }
+      }),
+      listen<{ url: string; pier_path?: string }>("ship-ready", e => {
+        if (existingPierPath && e.payload.pier_path === existingPierPath) {
+          setExistingShipUrl(e.payload.url);
+        } else {
+          setShipUrl(e.payload.url);
+        }
+      }),
+      listen<{ code: string; pier_path?: string }>("ship-code", e => {
+        if (existingPierPath && e.payload.pier_path === existingPierPath) {
+          setExistingAccessCode(e.payload.code);
+        } else {
+          setAccessCode(e.payload.code);
+        }
+      }),
       listen("ship-exited", () =>
         setLogs(prev => [...prev, "[portmate] Ship process ended."])
       ),
     ];
 
     return () => { cleanups.forEach(p => p.then(fn => fn())); };
-  }, []);
+  }, [existingPierPath]);
+
+  // ── New comet handlers ─────────────────────────────────────────────────────
 
   async function pickDirectory() {
     const selected = await open({ directory: true, title: "Choose where to store your ship" });
@@ -76,6 +98,7 @@ export function BootWizard({ onComplete }: Props) {
       setError(String(e)); setBooting(false);
     }
   }
+
   async function handleSelectExisting() {
     const selected = await open({
       title: "Select Urbit binary",
@@ -86,19 +109,42 @@ export function BootWizard({ onComplete }: Props) {
       setStep("boot");
     }
   }
-  const stepIndex = STEPS.indexOf(step);
+
+  // ── Existing ship handlers ─────────────────────────────────────────────────
+
+  async function pickExistingPier() {
+    const selected = await open({
+      directory: true,
+      title: "Select your existing Urbit pier folder",
+    });
+    if (typeof selected === "string") setExistingPierPath(selected);
+  }
+
+  async function handleBootExisting() {
+    setError(""); setExistingBooting(true);
+    try {
+      await invoke("boot_existing", { pierPath: existingPierPath });
+    } catch (e) {
+      setError(String(e)); setExistingBooting(false);
+    }
+  }
+
+  const stepIndex = NEW_SHIP_STEPS.indexOf(step);
 
   return (
     <div style={{ maxWidth: 680, margin: "0 auto", padding: "32px 24px", fontFamily: "system-ui, sans-serif" }}>
-      {/* Progress dots */}
-      <div style={{ display: "flex", gap: 8, marginBottom: 32 }}>
-        {STEPS.map((s, i) => (
-          <div key={s} style={{
-            width: 10, height: 10, borderRadius: "50%",
-            background: i <= stepIndex ? "#0070f3" : "#ddd"
-          }} />
-        ))}
-      </div>
+
+      {/* Progress dots — only shown for new ship flow */}
+      {step !== "existing" && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 32 }}>
+          {NEW_SHIP_STEPS.map((s, i) => (
+            <div key={s} style={{
+              width: 10, height: 10, borderRadius: "50%",
+              background: i <= stepIndex ? "#0070f3" : "#ddd"
+            }} />
+          ))}
+        </div>
+      )}
 
       {/* ── Welcome ── */}
       {step === "welcome" && (
@@ -118,13 +164,92 @@ export function BootWizard({ onComplete }: Props) {
             </p>
           )}
 
-          <button
-            onClick={() => setStep("setup")}
-            disabled={!platform?.supported}
-            style={btnStyle}
-          >
-            Get Started →
-          </button>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+            <button
+              onClick={() => setStep("setup")}
+              disabled={!platform?.supported}
+              style={btnStyle}
+            >
+              Boot New Comet →
+            </button>
+            <button
+              onClick={() => { setError(""); setStep("existing"); }}
+              style={btnSecStyle}
+            >
+              Boot Existing Ship →
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Existing Ship ── */}
+      {step === "existing" && (
+        <div>
+          <h2>Boot Existing Ship</h2>
+          <p style={{ color: "#666", fontSize: 14 }}>
+            Select the pier folder of your existing Urbit ship (moon, planet, comet, etc).
+            The Urbit binary will be detected automatically from the same directory — or
+            downloaded if not found.
+          </p>
+
+          <label style={labelStyle}>Pier folder</label>
+          <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+            <input
+              readOnly
+              value={existingPierPath}
+              placeholder="Select your pier folder…"
+              style={{ ...inputStyle, flex: 1, cursor: "pointer" }}
+              onClick={pickExistingPier}
+            />
+            <button onClick={pickExistingPier} style={btnSmallStyle}>Browse</button>
+          </div>
+
+          {error && <p style={{ color: "red", fontSize: 14 }}>{error}</p>}
+
+          {!existingBooting && !existingShipUrl && (
+            <div style={{ display: "flex", gap: 12 }}>
+              <button onClick={() => { setStep("welcome"); setError(""); }} style={btnSecStyle}>
+                ← Back
+              </button>
+              <button
+                onClick={handleBootExisting}
+                disabled={!existingPierPath}
+                style={btnStyle}
+              >
+                Boot Ship 🚀
+              </button>
+            </div>
+          )}
+
+          {existingBooting && !existingShipUrl && (
+            <p style={{ color: "#666" }}>⏳ Booting… this can take a few minutes.</p>
+          )}
+
+          {existingShipUrl && (
+            <div style={{
+              background: "#f0fdf4", border: "1px solid #86efac",
+              borderRadius: 8, padding: "16px", marginBottom: 16
+            }}>
+              <p style={{ margin: 0, fontWeight: 600, color: "#166534" }}>✅ Ship is running!</p>
+              {existingAccessCode ? (
+                <p style={{ marginTop: 8, fontFamily: "monospace", fontSize: 16 }}>
+                  Access code: <strong>{existingAccessCode}</strong>
+                </p>
+              ) : (
+                <p style={{ fontSize: 13, color: "#555", marginTop: 8 }}>
+                  Waiting for access code from dojo…
+                </p>
+              )}
+              <button
+                onClick={() => { openUrl(existingShipUrl); onComplete?.(); }}
+                style={{ ...btnStyle, marginTop: 12 }}
+              >
+                Open Landscape →
+              </button>
+            </div>
+          )}
+
+          {existingLogs.length > 0 && <TerminalOutput logs={existingLogs} />}
         </div>
       )}
 
@@ -170,45 +295,45 @@ export function BootWizard({ onComplete }: Props) {
 
       {/* ── Download ── */}
       {step === "download" && (
-  <div>
-    <h2>Downloading Urbit Runtime</h2>
-    <p style={{ color: "#666", fontSize: 14 }}>
-      Fetching the Urbit runtime for {platform?.os}/{platform?.arch}…
-    </p>
+        <div>
+          <h2>Downloading Urbit Runtime</h2>
+          <p style={{ color: "#666", fontSize: 14 }}>
+            Fetching the Urbit runtime for {platform?.os}/{platform?.arch}…
+          </p>
 
-    {downloading ? (
-      <div>
-        <div style={{ background: "#eee", borderRadius: 4, height: 12, marginBottom: 8 }}>
-          <div style={{
-            background: "#0070f3", height: "100%",
-            borderRadius: 4, width: `${progress}%`,
-            transition: "width 0.2s ease"
-          }} />
+          {downloading ? (
+            <div>
+              <div style={{ background: "#eee", borderRadius: 4, height: 12, marginBottom: 8 }}>
+                <div style={{
+                  background: "#0070f3", height: "100%",
+                  borderRadius: 4, width: `${progress}%`,
+                  transition: "width 0.2s ease"
+                }} />
+              </div>
+              <p style={{ fontSize: 13, color: "#666" }}>{progress}% downloaded</p>
+            </div>
+          ) : (
+            <>
+              {error && <p style={{ color: "red", fontSize: 14 }}>{error}</p>}
+              <div style={{ display: "flex", gap: 12 }}>
+                <button onClick={() => setStep("setup")} style={btnSecStyle}>← Back</button>
+                <button onClick={handleDownload} style={btnStyle}>Download Runtime</button>
+              </div>
+
+              <div style={{ marginTop: 24, paddingTop: 24, borderTop: "1px solid #eee" }}>
+                <p style={{ fontSize: 14, color: "#666", marginBottom: 12 }}>
+                  Already have the Urbit runtime?
+                </p>
+                <button onClick={handleSelectExisting} style={btnSecStyle}>
+                  Browse for existing binary
+                </button>
+              </div>
+            </>
+          )}
         </div>
-        <p style={{ fontSize: 13, color: "#666" }}>{progress}% downloaded</p>
-      </div>
-    ) : (
-      <>
-        {error && <p style={{ color: "red", fontSize: 14 }}>{error}</p>}
-        <div style={{ display: "flex", gap: 12 }}>
-          <button onClick={() => setStep("setup")} style={btnSecStyle}>← Back</button>
-          <button onClick={handleDownload} style={btnStyle}>Download Runtime</button>
-        </div>
+      )}
 
-        <div style={{ marginTop: 24, paddingTop: 24, borderTop: "1px solid #eee" }}>
-        <p style={{ fontSize: 14, color: "#666", marginBottom: 12 }}>
-          Already have the Urbit runtime?
-        </p>
-        <button onClick={handleSelectExisting} style={btnSecStyle}>
-          Browse for existing binary
-        </button>
-      </div>
-      </>
-    )}
-  </div>
-)}
-
-      {/* ── Boot ── */}
+      {/* ── Boot (new comet) ── */}
       {step === "boot" && (
         <div>
           <h2>Boot Your Ship</h2>

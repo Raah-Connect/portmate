@@ -7,6 +7,7 @@ use commands::boot::{
     boot_comet, delete_ship, download_urbit, get_platform_info, get_running_ships, is_ship_running,
     restart_ship, send_dojo, stop_ship,
 };
+use commands::boot_existing::boot_existing;
 use commands::memory::{chop_ship, meld_ship, pack_ship, roll_ship};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -164,6 +165,7 @@ pub fn run() {
             download_urbit,
             // ship lifecycle
             boot_comet,
+            boot_existing,
             send_dojo,
             restart_ship,
             stop_ship,
