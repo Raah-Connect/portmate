@@ -256,7 +256,8 @@ pub fn boot_comet(
                         code_asked = true;
                         let port = loopback_port.unwrap_or_else(|| {
                             let _ = app_out.emit("ship-log", serde_json::json!({
-                                "line": "[portmate] Warning: loopback port unknown, falling back to 12321"
+                                "line": "[portmate] Warning: loopback port unknown, falling back to 12321",
+                                "pier_path": pier_path_out,
                             }));
                             12321
                         });
@@ -264,58 +265,74 @@ pub fn boot_comet(
                         let app_lens = app_out.clone();
                         let pier_path_lens = pier_path_out.clone();
                         thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_secs(5));
                             let client = reqwest::blocking::Client::new();
-                            let res = client
-                                .post(format!("http://localhost:{}", port))
-                                .header("Content-Type", "application/json")
-                                .body(r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#)
-                                .send();
+                            let mut code = String::new();
 
-                            match res {
-                                Ok(resp) => {
-                                    let text = resp.text().unwrap_or_default();
-                                    let code = text
-                                        .trim()
-                                        .trim_matches('"')
-                                        .replace("\\n", "")
-                                        .trim()
-                                        .to_string();
+                            // Retry every 3 seconds for up to 2 minutes
+                            for attempt in 1..=40 {
+                                std::thread::sleep(std::time::Duration::from_secs(3));
 
-                                    if !code.is_empty() {
-                                        let state = app_lens.state::<ShipState>();
-                                        let mut ships = state.ships.lock().unwrap();
-                                        if let Some(ship) =
-                                            ships.iter_mut().find(|s| s.pier_path == pier_path_lens)
-                                        {
-                                            ship.access_code = code.clone();
+                                let res = client
+                                    .post(format!("http://localhost:{}", port))
+                                    .header("Content-Type", "application/json")
+                                    .body(r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#)
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .send();
+
+                                match res {
+                                    Ok(resp) => {
+                                        let text = resp.text().unwrap_or_default();
+                                        let candidate = text
+                                            .trim()
+                                            .trim_matches('"')
+                                            .replace("\\n", "")
+                                            .trim()
+                                            .to_string();
+
+                                        if !candidate.is_empty() {
+                                            code = candidate;
+                                            break;
                                         }
-                                        drop(ships);
-                                        let _ = state.save();
-                                        let _ = app_lens.emit(
-                                            "ship-code",
-                                            serde_json::json!({
-                                                "pier_path": pier_path_lens,
-                                                "code":      code,
-                                            }),
-                                        );
-                                    } else {
-                                        let _ = app_lens.emit(
-                                            "ship-log",
-                                            serde_json::json!({
-                                                "line": "[lens] received empty code response"
-                                            }),
-                                        );
+                                        let _ = app_lens.emit("ship-log", serde_json::json!({
+                                            "line": format!("[lens] attempt {} — empty response, retrying…", attempt),
+                                            "pier_path": pier_path_lens,
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        let _ = app_lens.emit("ship-log", serde_json::json!({
+                                            "line": format!("[lens] attempt {} — {}, retrying…", attempt, e),
+                                            "pier_path": pier_path_lens,
+                                        }));
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = app_lens.emit(
-                                        "ship-log",
-                                        serde_json::json!({
-                                            "line": format!("[lens error] {}", e)
-                                        }),
-                                    );
+                            }
+
+                            if !code.is_empty() {
+                                let state = app_lens.state::<ShipState>();
+                                let mut ships = state.ships.lock().unwrap();
+                                if let Some(ship) = ships
+                                    .iter_mut()
+                                    .find(|s| s.pier_path == pier_path_lens)
+                                {
+                                    ship.access_code = code.clone();
                                 }
+                                drop(ships);
+                                let _ = state.save();
+                                let _ = app_lens.emit(
+                                    "ship-code",
+                                    serde_json::json!({
+                                        "pier_path": pier_path_lens,
+                                        "code":      code,
+                                    }),
+                                );
+                            } else {
+                                let _ = app_lens.emit(
+                                    "ship-log",
+                                    serde_json::json!({
+                                        "line": "[lens] gave up after 40 attempts — could not retrieve access code",
+                                        "pier_path": pier_path_lens,
+                                    }),
+                                );
                             }
                         });
                     }
@@ -341,14 +358,23 @@ pub fn boot_comet(
 
     // stderr thread
     let app_err = app.clone();
+    let pier_path_err = pier_path.clone();
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().flatten() {
             let _ = app_err.emit(
                 "ship-log",
                 serde_json::json!({
-                    "line": format!("[stderr] {}", line)
+                    "line": format!("[stderr] {}", line),
+                    "pier_path": pier_path_err,
                 }),
             );
+            // Temporary debug — remove after confirming
+            //if line.contains("pier") || line.contains("loopback") || line.contains("web interface") {
+              //  let _ = app_err.emit("ship-log", serde_json::json!({
+               //     "line": format!("[DEBUG stderr] {}", line),
+                //    "pier_path": pier_path_err,
+               // }));
+            //}
         }
     });
 
@@ -431,7 +457,6 @@ pub fn restart_ship(
         .map(|(dir, _)| dir.to_string())
         .ok_or("Could not determine pier directory")?;
 
-    // Stop the process and its worker children
     // Kill all urbit processes for this pier by path
     #[cfg(unix)]
     {
