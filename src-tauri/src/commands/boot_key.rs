@@ -9,7 +9,10 @@ use crate::{ShipInfo, ShipState};
 // ── Boot from Key File ────────────────────────────────────────────────────────
 //
 // Boots any Urbit identity (moon, planet, star, galaxy) from a .key file.
-// Command: urbit -w <ship_name> -k <key_file_path> -c <pier_path>
+// Command: urbit -w <ship_name> -G <key_contents> -c <pier_path>
+//
+// The key file is read and trimmed before being passed via -G, which handles
+// trailing newlines or whitespace regardless of how the file was saved.
 //
 // The ship name is derived from the key filename:
 //   worteg-rovder-fidzod-fidfes.key → worteg-rovder-fidzod-fidfes
@@ -137,6 +140,17 @@ pub async fn boot_key(
         return Err(format!("Pier directory not found at {}", pier_dir));
     }
 
+    // Read and trim the key file contents — handles trailing newlines or
+    // whitespace regardless of how the file was saved
+    let key_contents = std::fs::read_to_string(&key_file_path)
+        .map_err(|e| format!("Failed to read key file: {e}"))?
+        .trim()
+        .to_string();
+
+    if key_contents.is_empty() {
+        return Err("Key file is empty".to_string());
+    }
+
     // Derive ship name from the key filename
     // e.g. worteg-rovder-fidzod-fidfes.key → worteg-rovder-fidzod-fidfes
     let ship_name = std::path::Path::new(&key_file_path)
@@ -174,7 +188,7 @@ pub async fn boot_key(
     let mut child = Command::new(&binary_path)
         .args([
             "-w", &ship_name,
-            "-k", &key_file_path,
+            "-G", &key_contents,
             "-c", &pier_path,
             "--loom", "34",
             "-t",
