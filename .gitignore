@@ -1,4 +1,13 @@
-<<<<<<< HEAD
+# Rust
+target/
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+dist-ssr
+*.local
+
 # Logs
 logs
 *.log
@@ -8,29 +17,6 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-=======
-# Rust
-target/
-
-# Node
-node_modules/
-dist/
-
 # Tauri
 src-tauri/gen/android/
 src-tauri/gen/apple/
@@ -39,6 +25,11 @@ src-tauri/gen/apple/
 .DS_Store
 
 # Editor
-.vscode/
-.idea/
->>>>>>> b4b176649e9bc8ea8e1177968d4e2e0c80b889e0
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
