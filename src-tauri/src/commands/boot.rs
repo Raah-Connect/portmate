@@ -1,10 +1,12 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{ShipInfo, ShipState};
+use crate::commands::ship_stats::refresh_ship_size;
 
 // ── Platform ──────────────────────────────────────────────────────────────────
 
@@ -20,11 +22,7 @@ pub fn get_platform_info() -> PlatformInfo {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
     let supported = download_url(&os, &arch).is_some();
-    PlatformInfo {
-        os,
-        arch,
-        supported,
-    }
+    PlatformInfo { os, arch, supported }
 }
 
 fn download_url(os: &str, arch: &str) -> Option<&'static str> {
@@ -33,6 +31,10 @@ fn download_url(os: &str, arch: &str) -> Option<&'static str> {
         ("macos", "x86_64") => Some("https://urbit.org/install/macos-x86_64/latest"),
         ("linux", "x86_64") => Some("https://urbit.org/install/linux-x86_64/latest"),
         ("linux", "aarch64") => Some("https://urbit.org/install/linux-aarch64/latest"),
+        // Note: no trailing space
+        ("windows", "x86_64") => {
+            Some("https://github.com/urbit/vere/releases/latest/download/windows-x86_64.tgz")
+        }
         _ => None,
     }
 }
@@ -76,11 +78,7 @@ pub async fn download_urbit(dest_dir: String, app: AppHandle) -> Result<String, 
         };
         let _ = app.emit(
             "download-progress",
-            DownloadProgress {
-                percent,
-                downloaded,
-                total,
-            },
+            DownloadProgress { percent, downloaded, total },
         );
     }
 
@@ -91,6 +89,9 @@ fn extract_urbit(bytes: &[u8], dest_dir: &std::path::Path) -> Result<String, Str
     use flate2::read::GzDecoder;
     use tar::Archive;
 
+    // On Windows the binary is named urbit.exe / vere.exe
+    let binary_out_name = if cfg!(windows) { "urbit.exe" } else { "urbit" };
+
     let gz = GzDecoder::new(std::io::Cursor::new(bytes));
     let mut arc = Archive::new(gz);
 
@@ -99,8 +100,13 @@ fn extract_urbit(bytes: &[u8], dest_dir: &std::path::Path) -> Result<String, Str
         let path = entry.path().map_err(|e| e.to_string())?.to_path_buf();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if name == "urbit" || name.starts_with("urbit-") || name.starts_with("vere-") {
-            let out = dest_dir.join("urbit");
+        let is_urbit = name == "urbit"
+            || name == "urbit.exe"
+            || name.starts_with("urbit-")
+            || name.starts_with("vere-");
+
+        if is_urbit {
+            let out = dest_dir.join(binary_out_name);
             entry.unpack(&out).map_err(|e| e.to_string())?;
             make_executable(&out)?;
             return Ok(out.to_string_lossy().to_string());
@@ -135,7 +141,11 @@ pub fn boot_comet(
     app: AppHandle,
     state: State<'_, ShipState>,
 ) -> Result<(), String> {
-    let pier_path = format!("{}/{}", pier_dir, comet_name);
+    // Use Path::join so the separator is correct on every OS
+    let pier_path = Path::new(&pier_dir)
+        .join(&comet_name)
+        .to_string_lossy()
+        .to_string();
 
     // Don't boot if already running
     if state
@@ -148,15 +158,29 @@ pub fn boot_comet(
         return Err(format!("{} is already running", comet_name));
     }
 
-    // Use -c only for new piers, existing piers just get the path
-    let args: Vec<&str> = if std::path::Path::new(&pier_path).exists() {
-        vec![&pier_path, "--loom", "34", "-t"]
+    // On Windows, run from parent directory with just the pier name to match terminal behavior
+    let (cwd, args): (Option<&str>, Vec<&str>) = if cfg!(target_os = "windows") {
+        if Path::new(&pier_path).exists() {
+            // Existing: run from parent with just name
+            (Some(&pier_dir), vec![&comet_name, "-t"])
+        } else {
+            // New: run from parent with just name
+            (Some(&pier_dir), vec!["-c", &comet_name, "-t"])
+        }
     } else {
-        vec!["-c", &pier_path, "--loom", "34", "-t"]
+        // Unix: use full path as before
+        if Path::new(&pier_path).exists() {
+            (None, vec![&pier_path, "--loom", "34", "-t"])
+        } else {
+            (None, vec!["-c", &pier_path, "--loom", "34", "-t"])
+        }
     };
 
-    let mut child = Command::new(&binary_path)
-        .args(&args)
+    let mut cmd = Command::new(&binary_path);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
@@ -175,7 +199,6 @@ pub fn boot_comet(
             existing.status = "booting".to_string();
             existing.pid = Some(pid);
             existing.url = String::new();
-            //existing.access_code = String::new();  access_code preserved — it never changes for a ship
         } else {
             ships.push(ShipInfo {
                 name: comet_name.clone(),
@@ -185,10 +208,12 @@ pub fn boot_comet(
                 status: "booting".to_string(),
                 binary_path: binary_path.clone(),
                 pid: Some(pid),
+                pier_size_bytes: None,
             });
         }
     }
     let _ = state.save();
+    let _ = refresh_ship_size(&pier_path, &app, &state);
 
     // Stdin writer thread
     let (tx, rx) = mpsc::channel::<String>();
@@ -241,6 +266,7 @@ pub fn boot_comet(
                         }
                         drop(ships);
                         let _ = state.save();
+                        let _ = refresh_ship_size(&pier_path_out, &app_out, &state);
 
                         let _ = app_out.emit(
                             "ship-ready",
@@ -255,10 +281,13 @@ pub fn boot_comet(
                     if line.contains("pier (34): live") && !code_asked {
                         code_asked = true;
                         let port = loopback_port.unwrap_or_else(|| {
-                            let _ = app_out.emit("ship-log", serde_json::json!({
-                                "line": "[portmate] Warning: loopback port unknown, falling back to 12321",
-                                "pier_path": pier_path_out,
-                            }));
+                            let _ = app_out.emit(
+                                "ship-log",
+                                serde_json::json!({
+                                    "line": "[portmate] Warning: loopback port unknown, falling back to 12321",
+                                    "pier_path": pier_path_out,
+                                }),
+                            );
                             12321
                         });
 
@@ -268,7 +297,6 @@ pub fn boot_comet(
                             let client = reqwest::blocking::Client::new();
                             let mut code = String::new();
 
-                            // Retry every 3 seconds for up to 2 minutes
                             for attempt in 1..=40 {
                                 std::thread::sleep(std::time::Duration::from_secs(3));
 
@@ -293,16 +321,22 @@ pub fn boot_comet(
                                             code = candidate;
                                             break;
                                         }
-                                        let _ = app_lens.emit("ship-log", serde_json::json!({
-                                            "line": format!("[lens] attempt {} — empty response, retrying…", attempt),
-                                            "pier_path": pier_path_lens,
-                                        }));
+                                        let _ = app_lens.emit(
+                                            "ship-log",
+                                            serde_json::json!({
+                                                "line": format!("[lens] attempt {} — empty response, retrying…", attempt),
+                                                "pier_path": pier_path_lens,
+                                            }),
+                                        );
                                     }
                                     Err(e) => {
-                                        let _ = app_lens.emit("ship-log", serde_json::json!({
-                                            "line": format!("[lens] attempt {} — {}, retrying…", attempt, e),
-                                            "pier_path": pier_path_lens,
-                                        }));
+                                        let _ = app_lens.emit(
+                                            "ship-log",
+                                            serde_json::json!({
+                                                "line": format!("[lens] attempt {} — {}, retrying…", attempt, e),
+                                                "pier_path": pier_path_lens,
+                                            }),
+                                        );
                                     }
                                 }
                             }
@@ -310,9 +344,8 @@ pub fn boot_comet(
                             if !code.is_empty() {
                                 let state = app_lens.state::<ShipState>();
                                 let mut ships = state.ships.lock().unwrap();
-                                if let Some(ship) = ships
-                                    .iter_mut()
-                                    .find(|s| s.pier_path == pier_path_lens)
+                                if let Some(ship) =
+                                    ships.iter_mut().find(|s| s.pier_path == pier_path_lens)
                                 {
                                     ship.access_code = code.clone();
                                 }
@@ -350,6 +383,7 @@ pub fn boot_comet(
         }
         drop(ships);
         let _ = state.save();
+        let _ = refresh_ship_size(&pier_path_out, &app_out, &state);
         let _ = app_out.emit(
             "ship-exited",
             serde_json::json!({ "pier_path": pier_path_out }),
@@ -368,13 +402,6 @@ pub fn boot_comet(
                     "pier_path": pier_path_err,
                 }),
             );
-            // Temporary debug — remove after confirming
-            //if line.contains("pier") || line.contains("loopback") || line.contains("web interface") {
-              //  let _ = app_err.emit("ship-log", serde_json::json!({
-               //     "line": format!("[DEBUG stderr] {}", line),
-                //    "pier_path": pier_path_err,
-               // }));
-            //}
         }
     });
 
@@ -410,8 +437,11 @@ pub fn send_dojo(
 }
 
 #[tauri::command]
-pub fn stop_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(), String> {
-    // Kill process
+pub fn stop_ship(
+    pier_path: String,
+    app: AppHandle,
+    state: State<'_, ShipState>,
+) -> Result<(), String> {
     let mut processes = state.processes.lock().unwrap();
     if let Some(pos) = processes.iter().position(|(p, _)| p == &pier_path) {
         let (_, mut child) = processes.remove(pos);
@@ -419,12 +449,8 @@ pub fn stop_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(), S
     }
     drop(processes);
 
-    // Remove stdin channel
-    let mut txs = state.stdin_txs.lock().unwrap();
-    txs.retain(|(p, _)| p != &pier_path);
-    drop(txs);
+    state.stdin_txs.lock().unwrap().retain(|(p, _)| p != &pier_path);
 
-    // Update status
     let mut ships = state.ships.lock().unwrap();
     if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path) {
         ship.status = "stopped".to_string();
@@ -432,6 +458,7 @@ pub fn stop_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(), S
     }
     drop(ships);
     let _ = state.save();
+    let _ = refresh_ship_size(&pier_path, &app, &state);
 
     Ok(())
 }
@@ -451,22 +478,17 @@ pub fn restart_ship(
         .cloned()
         .ok_or("No ship found at that path")?;
 
-    let pier_dir = ship_info
-        .pier_path
-        .rsplit_once('/')
-        .map(|(dir, _)| dir.to_string())
-        .ok_or("Could not determine pier directory")?;
+    // Use Path::parent() — works correctly on both Unix and Windows
+    let pier_dir = Path::new(&pier_path)
+        .parent()
+        .ok_or("Could not determine pier directory")?
+        .to_string_lossy()
+        .to_string();
 
-    // Kill all urbit processes for this pier by path
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-9", "-f", &pier_path])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(800));
-    }
+    // Force-kill the process by PID, platform-appropriately
+    kill_ship_process(&ship_info, &pier_path);
 
-    // Also remove from our tracked processes if present
+    // Also remove from our tracked process list if present
     {
         let mut processes = state.processes.lock().unwrap();
         if let Some(pos) = processes.iter().position(|(p, _)| p == &pier_path) {
@@ -485,9 +507,49 @@ pub fn restart_ship(
     boot_comet(ship_info.binary_path, pier_dir, ship_info.name, app, state)
 }
 
+/// Kill the OS-level process for a ship, cross-platform.
+fn kill_ship_process(ship_info: &ShipInfo, pier_path: &str) {
+    // Prefer killing by PID when we have one — works the same everywhere.
+    if let Some(pid) = ship_info.pid {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+        #[cfg(windows)]
+        {
+            // /F force-kills, /T also terminates child processes of that PID
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+    } else {
+        // Fallback: match by pier path in the process name
+        #[cfg(unix)]
+        {
+            let _ = Command::new("pkill").args(["-9", "-f", pier_path]).output();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+        #[cfg(windows)]
+        {
+            // WMIC lets us kill by command-line substring when we have no PID
+            let _ = Command::new("wmic")
+                .args([
+                    "process",
+                    "where",
+                    &format!("CommandLine like '%{}%'", pier_path),
+                    "call",
+                    "terminate",
+                ])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+    }
+}
+
 #[tauri::command]
 pub fn delete_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(), String> {
-    // Stop first if running
     {
         let mut processes = state.processes.lock().unwrap();
         if let Some(pos) = processes.iter().position(|(p, _)| p == &pier_path) {
@@ -501,7 +563,6 @@ pub fn delete_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(),
         .unwrap()
         .retain(|(p, _)| p != &pier_path);
 
-    // Remove from ship list
     state
         .ships
         .lock()
@@ -509,9 +570,9 @@ pub fn delete_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(),
         .retain(|s| s.pier_path != pier_path);
     let _ = state.save();
 
-    // Delete pier directory
-    if std::path::Path::new(&pier_path).exists() {
-        std::fs::remove_dir_all(&pier_path).map_err(|e| format!("Failed to delete pier: {}", e))?;
+    if Path::new(&pier_path).exists() {
+        std::fs::remove_dir_all(&pier_path)
+            .map_err(|e| format!("Failed to delete pier: {}", e))?;
     }
 
     Ok(())

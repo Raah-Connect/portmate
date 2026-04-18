@@ -8,7 +8,7 @@ import "./App.css";
 
 function App() {
   const [ships, setShips]       = useState<ShipInfo[]>([]);
-  const [logs, setLogs]         = useState<string[]>([]);
+  const [logsByPier, setLogsByPier] = useState<Record<string, string[]>>({});
   const [showWizard, setShowWizard] = useState(false);
 
   useEffect(() => {
@@ -18,9 +18,15 @@ function App() {
       listen("ship-ready",  () => fetchShips()),
       listen("ship-exited", () => fetchShips()),
       listen("ship-code",   () => fetchShips()),
-      listen<{ line: string }>("ship-log", e =>
-        setLogs(prev => [...prev.slice(-300), e.payload.line])
-      ),
+      listen<{ line: string; pier_path?: string }>("ship-log", e => {
+        const pierPath = e.payload.pier_path;
+        if (!pierPath) return;
+
+        setLogsByPier(prev => ({
+          ...prev,
+          [pierPath]: [...(prev[pierPath] ?? []).slice(-300), e.payload.line],
+        }));
+      }),
     ];
 
     const interval = setInterval(fetchShips, 10000);
@@ -79,7 +85,7 @@ function App() {
             <ShipCard
               key={i}
               ship={ship}
-              logs={logs}
+              logs={logsByPier[ship.pierPath] ?? []}
               onStop={() => handleStop(ship.pierPath)}
               onRestart={() => handleRestart(ship.pierPath)}
               onDelete={() => handleDelete(ship.pierPath)}

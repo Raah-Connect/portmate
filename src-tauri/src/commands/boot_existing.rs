@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -12,6 +13,7 @@ use crate::ShipInfo;
 // Boots any existing pier that already has a data directory on disk.
 // Works for moons, planets, stars, galaxies, and comets.
 // Command: urbit <pier_path> --loom 34 -t
+// On Windows, existing piers omit the loom flag.
 //
 // The urbit binary is auto-detected from the parent directory of the pier.
 // If not found, it is automatically downloaded for the current OS/arch.
@@ -22,6 +24,10 @@ fn download_url(os: &str, arch: &str) -> Option<&'static str> {
         ("macos", "x86_64")  => Some("https://urbit.org/install/macos-x86_64/latest"),
         ("linux", "x86_64")  => Some("https://urbit.org/install/linux-x86_64/latest"),
         ("linux", "aarch64") => Some("https://urbit.org/install/linux-aarch64/latest"),
+        // Note: no trailing space
+        ("windows", "x86_64") => {
+            Some("https://github.com/urbit/vere/releases/latest/download/windows-x86_64.tgz")
+        }
         _ => None,
     }
 }
@@ -29,6 +35,9 @@ fn download_url(os: &str, arch: &str) -> Option<&'static str> {
 fn extract_urbit(bytes: &[u8], dest_dir: &std::path::Path) -> Result<String, String> {
     use flate2::read::GzDecoder;
     use tar::Archive;
+
+    // On Windows the binary is named urbit.exe / vere.exe
+    let binary_out_name = if cfg!(windows) { "urbit.exe" } else { "urbit" };
 
     let gz = GzDecoder::new(std::io::Cursor::new(bytes));
     let mut arc = Archive::new(gz);
@@ -38,8 +47,13 @@ fn extract_urbit(bytes: &[u8], dest_dir: &std::path::Path) -> Result<String, Str
         let path = entry.path().map_err(|e| e.to_string())?.to_path_buf();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if name == "urbit" || name.starts_with("urbit-") || name.starts_with("vere-") {
-            let out = dest_dir.join("urbit");
+        let is_urbit = name == "urbit"
+            || name == "urbit.exe"
+            || name.starts_with("urbit-")
+            || name.starts_with("vere-");
+
+        if is_urbit {
+            let out = dest_dir.join(binary_out_name);
             entry.unpack(&out).map_err(|e| e.to_string())?;
             make_executable(&out)?;
             return Ok(out.to_string_lossy().to_string());
@@ -157,8 +171,28 @@ pub async fn boot_existing(
         return Err(format!("{} is already running", ship_name));
     }
 
-    let mut child = Command::new(&binary_path)
-        .args([&pier_path, "--loom", "34", "-t"])
+    // On Windows, run from parent directory with just the pier name to match terminal behavior
+    let pier_parent = Path::new(&pier_path)
+        .parent()
+        .ok_or("Could not determine parent directory")?
+        .to_string_lossy()
+        .to_string();
+    let pier_name_only = Path::new(&pier_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Could not extract pier name")?;
+
+    let (cwd_dir, args): (Option<String>, Vec<&str>) = if cfg!(target_os = "windows") {
+        (Some(pier_parent), vec![pier_name_only, "-t"])
+    } else {
+        (None, vec![&pier_path, "--loom", "34", "-t"])
+    };
+
+    let mut cmd = Command::new(&binary_path);
+    if let Some(dir) = cwd_dir {
+        cmd.current_dir(&dir);
+    }
+    let mut child = cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
@@ -187,6 +221,7 @@ pub async fn boot_existing(
                 status: "booting".to_string(),
                 binary_path: binary_path.clone(),
                 pid: Some(pid),
+                pier_size_bytes: None,
             });
         }
     }

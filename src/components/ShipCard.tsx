@@ -1,7 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { TerminalOutput } from "./TerminalOutput";
 import { MemoryManager } from "./MemoryManager";
+import { MemorySchedular } from "./MemorySchedular";
 
 export interface ShipInfo {
   name: string;
@@ -11,6 +14,12 @@ export interface ShipInfo {
   status: "booting" | "running" | "stopped";
   binaryPath: string;
   pid: number | null;
+  pierSizeBytes?: number | null;
+}
+
+interface ShipSizeUpdatedPayload {
+  pierPath: string;
+  pierSizeBytes: number;
 }
 
 interface Props {
@@ -21,12 +30,34 @@ interface Props {
   onDelete: () => void;
 }
 
-type Panel = "terminal" | "memory";
+type Panel = "terminal" | "memoryManager" | "memoryScheduler";
 
 export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
   const [activePanel, setActivePanel] = useState<Panel | null>(null);
   const [codeCopied, setCodeCopied]   = useState(false);
   const [confirming, setConfirming]   = useState<"stop" | "delete" | null>(null);
+  const [pierSizeBytes, setPierSizeBytes] = useState<number | null>(ship.pierSizeBytes ?? null);
+  const [sizeRefreshing, setSizeRefreshing] = useState(false);
+
+  useEffect(() => {
+    setPierSizeBytes(ship.pierSizeBytes ?? null);
+  }, [ship.pierSizeBytes, ship.pierPath]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<ShipSizeUpdatedPayload>("ship-size-updated", (event) => {
+      if (event.payload.pierPath !== ship.pierPath) return;
+      setPierSizeBytes(event.payload.pierSizeBytes);
+      setSizeRefreshing(false);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [ship.pierPath]);
 
   function togglePanel(panel: Panel) {
     setActivePanel(prev => prev === panel ? null : panel);
@@ -47,6 +78,20 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
     } else {
       setConfirming(action);
       setTimeout(() => setConfirming(null), 3000);
+    }
+  }
+
+  async function refreshPierSize() {
+    setSizeRefreshing(true);
+    try {
+      const size = await invoke<number>("refresh_ship_size_command", {
+        pierPath: ship.pierPath,
+      });
+      setPierSizeBytes(size);
+    } catch {
+      // Keep UX quiet for now; periodic refreshes and event updates still apply.
+    } finally {
+      setSizeRefreshing(false);
     }
   }
 
@@ -93,6 +138,19 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
             {ship.status === "booting" ? "Waiting for web interface…" : "Not running"}
           </span>
         )}
+        <div style={sizeWrapStyle}>
+          <span style={sizeLabelStyle}>
+            Pier size {pierSizeBytes == null ? "--" : formatBytes(pierSizeBytes)}
+          </span>
+          <button
+            onClick={refreshPierSize}
+            disabled={sizeRefreshing}
+            style={sizeRefreshBtnStyle(sizeRefreshing)}
+            title="Refresh pier size"
+          >
+            {sizeRefreshing ? "Refreshing..." : "Refresh"}
+          </button>
+        </div>
         <button
           onClick={copyCode}
           style={ship.accessCode ? codeBtnStyle : codeEmptyBtnStyle}
@@ -114,10 +172,16 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
           Terminal {activePanel === "terminal" ? "▲" : "▼"}
         </button>
         <button
-          onClick={() => togglePanel("memory")}
-          style={tabBtnStyle(activePanel === "memory", "#818cf8", "#1e1b4b", "#312e81")}
+          onClick={() => togglePanel("memoryManager")}
+          style={tabBtnStyle(activePanel === "memoryManager", "#818cf8", "#1e1b4b", "#312e81")}
         >
-          Memory {activePanel === "memory" ? "▲" : "▼"}
+          Memory Ops {activePanel === "memoryManager" ? "▲" : "▼"}
+        </button>
+        <button
+          onClick={() => togglePanel("memoryScheduler")}
+          style={tabBtnStyle(activePanel === "memoryScheduler", "#60a5fa", "#0b2244", "#1d4ed8")}
+        >
+          Maintenance Scheduler {activePanel === "memoryScheduler" ? "▲" : "▼"}
         </button>
       </div>
 
@@ -128,9 +192,18 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
         </div>
       )}
 
-      {/* ── Panel: Memory ── */}
-      {activePanel === "memory" && (
-        <MemoryManager ship={ship} onRestart={onRestart} />
+      {/* ── Panel: Memory Manager ── */}
+      {activePanel === "memoryManager" && (
+        <div style={memoryPanelStyle}>
+          <MemoryManager ship={ship} onRestart={onRestart} />
+        </div>
+      )}
+
+      {/* ── Panel: Memory Scheduler ── */}
+      {activePanel === "memoryScheduler" && (
+        <div style={memoryPanelStyle}>
+          <MemorySchedular ship={ship} />
+        </div>
       )}
 
       {/* ── Actions ── */}
@@ -164,6 +237,20 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
   );
 }
 
+function formatBytes(value: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unit = 0;
+
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+
+  const precision = unit <= 1 ? 0 : 1;
+  return `${size.toFixed(precision)} ${units[unit]}`;
+}
+
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 const cardStyle: React.CSSProperties = {
@@ -189,7 +276,33 @@ const infoRowStyle: React.CSSProperties = {
   padding: "10px 16px",
   borderBottom: "1px solid #1e293b",
   minHeight: 44,
+  flexWrap: "wrap",
 };
+
+const sizeWrapStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  marginLeft: "auto",
+};
+
+const sizeLabelStyle: React.CSSProperties = {
+  fontSize: 11,
+  color: "#94a3b8",
+  fontFamily: "monospace",
+};
+
+function sizeRefreshBtnStyle(disabled: boolean): React.CSSProperties {
+  return {
+    background: disabled ? "#111827" : "#1e293b",
+    color: disabled ? "#64748b" : "#cbd5e1",
+    border: "1px solid #334155",
+    borderRadius: 6,
+    padding: "4px 8px",
+    fontSize: 11,
+    cursor: disabled ? "not-allowed" : "pointer",
+  };
+}
 
 const tabBarStyle: React.CSSProperties = {
   display: "flex",
@@ -221,6 +334,10 @@ function tabBtnStyle(
 
 const panelStyle: React.CSSProperties = {
   padding: "12px 16px",
+  borderBottom: "1px solid #1e293b",
+};
+
+const memoryPanelStyle: React.CSSProperties = {
   borderBottom: "1px solid #1e293b",
 };
 

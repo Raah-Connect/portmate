@@ -129,24 +129,22 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn any_urbit_process_alive(pier_path: &str) -> bool {
-    // On Windows use WMIC to search for the pier path in process command lines.
-    std::process::Command::new("wmic")
-        .args([
-            "process",
-            "where",
-            &format!("CommandLine like '%{}%'", pier_path),
-            "get",
-            "ProcessId",
-        ])
+    // Use PowerShell to search for the pier path in process command lines.
+    // wmic is deprecated in Windows 10 21H1+ and removed from Windows 11.
+    let script = format!(
+        "(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' }} | Measure-Object).Count",
+        pier_path.replace('\'', "''")  // escape single quotes for PowerShell
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
         .output()
         .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            // Output has a header line + one line per match; if only header, no processes.
-            out.lines()
-                .filter(|l| !l.trim().is_empty() && !l.contains("ProcessId"))
-                .count()
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0)
                 > 0
         })
         .unwrap_or(false)
@@ -167,7 +165,8 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
 ///   2. Send |exit via dojo stdin.
 ///   3. Wait up to 30 s for the lock file to clear (worker exited).
 ///   4. Wait a further 10 s for the launcher to also fully exit.
-///   5. Only if processes are still alive after all that: SIGTERM then SIGKILL.
+///   5. Only if processes are still alive after all that: SIGTERM then SIGKILL
+///      (Unix), or taskkill /F /T (Windows).
 fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, ShipState>) {
     let lock = std::path::Path::new(pier_path).join(".urb").join("lock");
 
@@ -194,7 +193,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
             app,
             pier_path,
             "[portmate] Warning: ship does not appear to be running. \
-             If it was previously hard-killed (SIGKILL), the pier state may be \
+             If it was previously hard-killed, the pier state may be \
              dirty and roll/chop may fail with 'shenanigans!'. \
              To recover: boot the ship, wait for it to fully start \
              (pier live message), then stop it cleanly and retry.",
@@ -263,9 +262,10 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
             emit_log(
                 app,
                 pier_path,
-                "[portmate] Processes still alive after 10s — sending SIGTERM…",
+                "[portmate] Processes still alive after 10s — force-killing…",
             );
 
+            // Unix: SIGTERM first, then SIGKILL
             #[cfg(unix)]
             {
                 let _ = std::process::Command::new("pkill")
@@ -274,7 +274,8 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 std::thread::sleep(std::time::Duration::from_secs(3));
             }
 
-            // Kill tracked child.
+            // Kill the tracked child (cross-platform — Tauri's Child::kill()
+            // calls TerminateProcess on Windows and SIGKILL on Unix)
             {
                 let mut processes = state.processes.lock().unwrap();
                 if let Some(pos) = processes.iter().position(|(p, _)| p == pier_path) {
@@ -283,7 +284,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 }
             }
 
-            // Last resort SIGKILL.
+            // Unix last-resort SIGKILL (catches the worker and any stragglers)
             #[cfg(unix)]
             {
                 let _ = std::process::Command::new("pkill")
@@ -292,9 +293,30 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
 
+            // Windows: taskkill /F /T kills the target and all its children.
+            // Run it once for TERM-equivalent and once more as last resort.
+            // We use PowerShell to find PIDs by command-line then taskkill each,
+            // because taskkill /FI "COMMANDLINE like ..." is not reliable.
+            #[cfg(windows)]
+            {
+                let script = format!(
+                    "Get-CimInstance Win32_Process \
+                     | Where-Object {{ $_.CommandLine -like '*{}*' }} \
+                     | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}",
+                    pier_path.replace('\'', "''")
+                );
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", &script])
+                    .output();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+
             if any_urbit_process_alive(pier_path) {
-                emit_log(app, pier_path,
-                    "[portmate] Warning: could not kill all urbit processes — op may fail with 'shenanigans!'"
+                emit_log(
+                    app,
+                    pier_path,
+                    "[portmate] Warning: could not kill all urbit processes — \
+                     op may fail with 'shenanigans!'",
                 );
             }
 
@@ -407,7 +429,7 @@ fn is_pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {}", pid), "/NH"])

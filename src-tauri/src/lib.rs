@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tauri::Manager;
 
 mod commands;
 
@@ -10,6 +11,13 @@ use commands::boot::{
 use commands::boot_existing::boot_existing;
 use commands::boot_key::boot_key;
 use commands::memory::{chop_ship, meld_ship, pack_ship, roll_ship};
+use commands::memory_sched::{
+    clear_memory_schedule, get_memory_schedule, list_memory_schedules, load_schedules_into_state,
+    set_memory_schedule, MemorySchedule,
+};
+use commands::ship_stats::{
+    refresh_all_ship_sizes, refresh_all_sizes_now, refresh_ship_size_command,
+};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -21,12 +29,14 @@ pub struct ShipInfo {
     pub status: String,
     pub binary_path: String,
     pub pid: Option<u32>,
+    pub pier_size_bytes: Option<u64>,
 }
 
 pub struct ShipState {
     pub processes: Mutex<Vec<(String, std::process::Child)>>,
     pub stdin_txs: Mutex<Vec<(String, std::sync::mpsc::Sender<String>)>>,
     pub ships: Mutex<Vec<ShipInfo>>,
+    pub memory_schedules: Mutex<Vec<MemorySchedule>>,
     pub data_dir: PathBuf,
 }
 
@@ -96,6 +106,7 @@ impl ShipState {
             processes: Mutex::new(Vec::new()),
             stdin_txs: Mutex::new(Vec::new()),
             ships: Mutex::new(ships),
+            memory_schedules: Mutex::new(Vec::new()),
             data_dir,
         }
     }
@@ -156,10 +167,35 @@ pub fn run() {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("portmate");
 
+    let state = ShipState::new(data_dir);
+    if let Err(e) = load_schedules_into_state(&state) {
+        eprintln!("[portmate] Failed to load memory schedules: {e}");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(ShipState::new(data_dir))
+        .manage(state)
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+
+            let state: tauri::State<'_, ShipState> = app.state();
+            if let Err(e) = refresh_all_sizes_now(&app_handle, &state) {
+                eprintln!("[portmate] Failed to refresh ship sizes at startup: {e}");
+            }
+
+            let app_handle_for_thread = app_handle.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
+
+                let state: tauri::State<'_, ShipState> = app_handle_for_thread.state();
+                if let Err(e) = refresh_all_sizes_now(&app_handle_for_thread, &state) {
+                    eprintln!("[portmate] Failed periodic ship size refresh: {e}");
+                }
+            });
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // platform / download
             get_platform_info,
@@ -179,6 +215,14 @@ pub fn run() {
             meld_ship,
             roll_ship,
             chop_ship,
+            // memory schedules
+            get_memory_schedule,
+            set_memory_schedule,
+            clear_memory_schedule,
+            list_memory_schedules,
+            // ship stats
+            refresh_ship_size_command,
+            refresh_all_ship_sizes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -10,6 +11,7 @@ use crate::{ShipInfo, ShipState};
 //
 // Boots any Urbit identity (moon, planet, star, galaxy) from a .key file.
 // Command: urbit -w <ship_name> -G <key_contents> -c <pier_path>
+// On Windows, keyed boots omit the loom flag.
 //
 // The key file is read and trimmed before being passed via -G, which handles
 // trailing newlines or whitespace regardless of how the file was saved.
@@ -26,6 +28,10 @@ fn download_url(os: &str, arch: &str) -> Option<&'static str> {
         ("macos", "x86_64")  => Some("https://urbit.org/install/macos-x86_64/latest"),
         ("linux", "x86_64")  => Some("https://urbit.org/install/linux-x86_64/latest"),
         ("linux", "aarch64") => Some("https://urbit.org/install/linux-aarch64/latest"),
+        // Note: no trailing space
+        ("windows", "x86_64") => {
+            Some("https://github.com/urbit/vere/releases/latest/download/windows-x86_64.tgz")
+        }
         _ => None,
     }
 }
@@ -33,6 +39,9 @@ fn download_url(os: &str, arch: &str) -> Option<&'static str> {
 fn extract_urbit(bytes: &[u8], dest_dir: &std::path::Path) -> Result<String, String> {
     use flate2::read::GzDecoder;
     use tar::Archive;
+
+    // On Windows the binary is named urbit.exe / vere.exe
+    let binary_out_name = if cfg!(windows) { "urbit.exe" } else { "urbit" };
 
     let gz = GzDecoder::new(std::io::Cursor::new(bytes));
     let mut arc = Archive::new(gz);
@@ -42,8 +51,13 @@ fn extract_urbit(bytes: &[u8], dest_dir: &std::path::Path) -> Result<String, Str
         let path = entry.path().map_err(|e| e.to_string())?.to_path_buf();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if name == "urbit" || name.starts_with("urbit-") || name.starts_with("vere-") {
-            let out = dest_dir.join("urbit");
+        let is_urbit = name == "urbit"
+            || name == "urbit.exe"
+            || name.starts_with("urbit-")
+            || name.starts_with("vere-");
+
+        if is_urbit {
+            let out = dest_dir.join(binary_out_name);
             entry.unpack(&out).map_err(|e| e.to_string())?;
             make_executable(&out)?;
             return Ok(out.to_string_lossy().to_string());
@@ -69,7 +83,7 @@ fn make_executable(_: &std::path::Path) -> Result<(), String> {
 }
 
 async fn find_or_download_binary(pier_dir: &str, app: &AppHandle) -> Result<String, String> {
-    let dir = std::path::Path::new(pier_dir);
+    let dir = Path::new(pier_dir);
 
     let binary_name = if cfg!(windows) { "urbit.exe" } else { "urbit" };
     let binary_path = dir.join(binary_name);
@@ -131,12 +145,12 @@ pub async fn boot_key(
     state: tauri::State<'_, ShipState>,
 ) -> Result<(), String> {
     // Verify the key file exists
-    if !std::path::Path::new(&key_file_path).exists() {
+    if !Path::new(&key_file_path).exists() {
         return Err(format!("Key file not found at {}", key_file_path));
     }
 
     // Verify the pier directory exists
-    if !std::path::Path::new(&pier_dir).exists() {
+    if !Path::new(&pier_dir).exists() {
         return Err(format!("Pier directory not found at {}", pier_dir));
     }
 
@@ -153,15 +167,18 @@ pub async fn boot_key(
 
     // Derive ship name from the key filename
     // e.g. worteg-rovder-fidzod-fidfes.key → worteg-rovder-fidzod-fidfes
-    let ship_name = std::path::Path::new(&key_file_path)
+    let ship_name = Path::new(&key_file_path)
         .file_stem()
         .and_then(|n| n.to_str())
         .ok_or("Could not determine ship name from key filename")?
         .trim_start_matches('~')
         .to_string();
 
-    // Construct the pier path: pier_dir/ship_name
-    let pier_path = format!("{}/{}", pier_dir, ship_name);
+    // Use Path::join so the separator is correct on every OS
+    let pier_path = Path::new(&pier_dir)
+        .join(&ship_name)
+        .to_string_lossy()
+        .to_string();
 
     // Don't boot if already running
     if state
@@ -175,7 +192,7 @@ pub async fn boot_key(
     }
 
     // Don't boot if the pier already exists — use boot_existing instead
-    if std::path::Path::new(&pier_path).exists() {
+    if Path::new(&pier_path).exists() {
         return Err(format!(
             "Pier already exists at {}. Use 'Boot Existing Ship' to resume it.",
             pier_path
@@ -185,14 +202,24 @@ pub async fn boot_key(
     // Auto-detect or download the binary from the pier directory
     let binary_path = find_or_download_binary(&pier_dir, &app).await?;
 
-    let mut child = Command::new(&binary_path)
-        .args([
-            "-w", &ship_name,
-            "-G", &key_contents,
-            "-c", &pier_path,
-            "--loom", "34",
+    let args: Vec<&str> = if cfg!(target_os = "windows") {
+        vec!["-w", &ship_name, "-G", &key_contents, "-c", &pier_path, "-t"]
+    } else {
+        vec![
+            "-w",
+            &ship_name,
+            "-G",
+            &key_contents,
+            "-c",
+            &pier_path,
+            "--loom",
+            "34",
             "-t",
-        ])
+        ]
+    };
+
+    let mut child = Command::new(&binary_path)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
@@ -215,6 +242,7 @@ pub async fn boot_key(
             status: "booting".to_string(),
             binary_path: binary_path.clone(),
             pid: Some(pid),
+            pier_size_bytes: None,
         });
     }
     let _ = state.save();
