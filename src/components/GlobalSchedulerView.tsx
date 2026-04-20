@@ -36,7 +36,7 @@ export function GlobalSchedulerView({ ships }: Props) {
 			<div style={topBarStyle}>
 				<div>
 					<div style={eyebrowStyle}>Global Scheduler</div>
-					<h2 style={titleStyle}>Plan maintenance without opening a ship card</h2>
+					<h2 style={titleStyle}>Plan maintenance</h2>
 					<p style={subtitleStyle}>
 						Pick a ship, review the next scheduled run, and manage each operation independently.
 					</p>

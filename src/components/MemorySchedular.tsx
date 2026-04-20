@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { ShipInfo } from "./ShipCard";
@@ -74,7 +74,9 @@ function createInitialRows(): ScheduleRowMap {
 }
 
 export function MemorySchedular({ ship }: Props) {
+	const containerRef = useRef<HTMLDivElement | null>(null);
 	const [rows, setRows] = useState<ScheduleRowMap>(() => createInitialRows());
+	const [isCompact, setIsCompact] = useState(false);
 	const [loading, setLoading] = useState(true);
 	const [message, setMessage] = useState("");
 	const [error, setError] = useState("");
@@ -117,6 +119,43 @@ export function MemorySchedular({ ship }: Props) {
 	useEffect(() => {
 		void loadSchedules();
 	}, [ship.pierPath]);
+
+	useEffect(() => {
+		const node = containerRef.current;
+		if (!node) {
+			return;
+		}
+
+		const syncLayout = (width: number) => {
+			setIsCompact(width < 1100);
+		};
+
+		syncLayout(node.getBoundingClientRect().width);
+
+		if (typeof ResizeObserver === "undefined") {
+			const handleResize = () => {
+				syncLayout(node.getBoundingClientRect().width);
+			};
+
+			window.addEventListener("resize", handleResize);
+			return () => {
+				window.removeEventListener("resize", handleResize);
+			};
+		}
+
+		const observer = new ResizeObserver((entries) => {
+			const entry = entries[0];
+			if (entry) {
+				syncLayout(entry.contentRect.width);
+			}
+		});
+
+		observer.observe(node);
+
+		return () => {
+			observer.disconnect();
+		};
+	}, []);
 
 	useEffect(() => {
 		let unlisten: (() => void) | undefined;
@@ -245,8 +284,73 @@ export function MemorySchedular({ ship }: Props) {
 
 	const hasAnySchedule = OPS.some((entry) => rows[entry.id].hasSchedule);
 
+	function renderIntervalEditor(op: OpId, row: ScheduleRowState, busy: boolean) {
+		return (
+			<div style={intervalCellStyle}>
+				<input
+					type="number"
+					min={1}
+					step={1}
+					value={row.intervalDays}
+					onChange={(e) => setIntervalForOp(op, Number(e.target.value))}
+					disabled={busy}
+					style={inputStyle}
+				/>
+				<div style={presetGroupStyle}>
+					<button
+						onClick={() => setIntervalForOp(op, 1)}
+						disabled={busy}
+						style={presetBtnStyle(row.intervalDays === 1)}
+					>
+						1d
+					</button>
+					<button
+						onClick={() => setIntervalForOp(op, 7)}
+						disabled={busy}
+						style={presetBtnStyle(row.intervalDays === 7)}
+					>
+						7d
+					</button>
+				</div>
+			</div>
+		);
+	}
+
+	function renderStatusContent(row: ScheduleRowState) {
+		return (
+			<div style={statusBlockStyle}>
+				<span style={statusPillStyle(row.running, row.lastStatus, row.hasSchedule)}>
+					{formatStatusLabel(row)}
+				</span>
+				{row.lastError && !row.error && <div style={rowErrorStyle}>{row.lastError}</div>}
+				{row.error && <div style={rowErrorStyle}>{row.error}</div>}
+			</div>
+		);
+	}
+
+	function renderActionButtons(op: OpId, row: ScheduleRowState, busy: boolean) {
+		return (
+			<div style={actionRowStyle}>
+				<button
+					onClick={() => void saveSchedule(op)}
+					disabled={busy}
+					style={primaryBtnStyle}
+				>
+					{row.saving ? "Saving..." : row.hasSchedule ? "Update" : "Save"}
+				</button>
+				<button
+					onClick={() => void clearSchedule(op)}
+					disabled={busy || !row.hasSchedule}
+					style={dangerBtnStyle(busy || !row.hasSchedule)}
+				>
+					{row.deleting ? "Removing..." : "Clear"}
+				</button>
+			</div>
+		);
+	}
+
 	return (
-		<div style={wrapStyle}>
+		<div ref={containerRef} style={wrapStyle}>
 			<div style={sectionLabelStyle}>Memory Scheduler</div>
 			<div style={headerRowStyle}>
 				<div>
@@ -266,60 +370,29 @@ export function MemorySchedular({ ship }: Props) {
 			{!loading && message && !error && <div style={bannerStyle("ok")}>{message}</div>}
 			{!loading && error && <div style={bannerStyle("error")}>{error}</div>}
 
-			<div style={tableWrapStyle}>
-				<table style={tableStyle}>
-					<thead>
-						<tr>
-							<th style={thStyle}>Operation</th>
-							<th style={thStyle}>Every N days</th>
-							<th style={thStyle}>Enabled</th>
-							<th style={thStyle}>Last run</th>
-							<th style={thStyle}>Next run</th>
-							<th style={thStyle}>Status</th>
-							<th style={thStyle}>Actions</th>
-						</tr>
-					</thead>
-					<tbody>
-						{OPS.map((entry) => {
-							const row = rows[entry.id];
-							const busy = loading || row.saving || row.deleting;
+			{isCompact ? (
+				<div style={compactListStyle}>
+					{OPS.map((entry) => {
+						const row = rows[entry.id];
+						const busy = loading || row.saving || row.deleting;
 
-							return (
-								<tr key={entry.id} style={trStyle}>
-									<td style={tdStyle}>
+						return (
+							<section key={entry.id} style={compactCardStyle}>
+								<div style={compactHeaderStyle}>
+									<div>
 										<div style={opLabelStyle}>{entry.label}</div>
 										<div style={helperTextStyle}>{entry.desc}</div>
-									</td>
-									<td style={tdStyle}>
-										<div style={intervalCellStyle}>
-											<input
-												type="number"
-												min={1}
-												step={1}
-												value={row.intervalDays}
-												onChange={(e) => setIntervalForOp(entry.id, Number(e.target.value))}
-												disabled={busy}
-												style={inputStyle}
-											/>
-											<div style={presetGroupStyle}>
-												<button
-													onClick={() => setIntervalForOp(entry.id, 1)}
-													disabled={busy}
-													style={presetBtnStyle(row.intervalDays === 1)}
-												>
-													1d
-												</button>
-												<button
-													onClick={() => setIntervalForOp(entry.id, 7)}
-													disabled={busy}
-													style={presetBtnStyle(row.intervalDays === 7)}
-												>
-													7d
-												</button>
-											</div>
-										</div>
-									</td>
-									<td style={tdStyle}>
+									</div>
+									{renderStatusContent(row)}
+								</div>
+
+								<div style={compactGridStyle}>
+									<div style={compactFieldStyle}>
+										<div style={compactFieldLabelStyle}>Every N days</div>
+										{renderIntervalEditor(entry.id, row, busy)}
+									</div>
+									<div style={compactFieldStyle}>
+										<div style={compactFieldLabelStyle}>Enabled</div>
 										<label style={toggleStyle}>
 											<input
 												type="checkbox"
@@ -329,44 +402,74 @@ export function MemorySchedular({ ship }: Props) {
 											/>
 											<span>{row.enabled ? "Active" : "Paused"}</span>
 										</label>
-									</td>
-									<td style={tdStyle}>
+									</div>
+									<div style={compactFieldStyle}>
+										<div style={compactFieldLabelStyle}>Last run</div>
 										<div style={timeValueStyle}>{formatScheduleTime(row.lastRunAt)}</div>
-									</td>
-									<td style={tdStyle}>
+									</div>
+									<div style={compactFieldStyle}>
+										<div style={compactFieldLabelStyle}>Next run</div>
 										<div style={timeValueStyle}>{formatScheduleTime(row.nextRunAt)}</div>
-									</td>
-									<td style={tdStyle}>
-										<span style={statusPillStyle(row.running, row.lastStatus, row.hasSchedule)}>
-											{formatStatusLabel(row)}
-										</span>
-										{row.lastError && !row.error && <div style={rowErrorStyle}>{row.lastError}</div>}
-										{row.error && <div style={rowErrorStyle}>{row.error}</div>}
-									</td>
-									<td style={tdStyle}>
-										<div style={actionRowStyle}>
-											<button
-												onClick={() => void saveSchedule(entry.id)}
-												disabled={busy}
-												style={primaryBtnStyle}
-											>
-												{row.saving ? "Saving..." : row.hasSchedule ? "Update" : "Save"}
-											</button>
-											<button
-												onClick={() => void clearSchedule(entry.id)}
-												disabled={busy || !row.hasSchedule}
-												style={dangerBtnStyle(busy || !row.hasSchedule)}
-											>
-												{row.deleting ? "Removing..." : "Clear"}
-											</button>
-										</div>
-									</td>
-								</tr>
-							);
-						})}
-					</tbody>
-				</table>
-			</div>
+									</div>
+								</div>
+
+								{renderActionButtons(entry.id, row, busy)}
+							</section>
+						);
+					})}
+				</div>
+			) : (
+				<div style={tableWrapStyle}>
+					<table style={tableStyle}>
+						<thead>
+							<tr>
+								<th style={thStyle}>Operation</th>
+								<th style={thStyle}>Every N days</th>
+								<th style={thStyle}>Enabled</th>
+								<th style={thStyle}>Last run</th>
+								<th style={thStyle}>Next run</th>
+								<th style={thStyle}>Status</th>
+								<th style={thStyle}>Actions</th>
+							</tr>
+						</thead>
+						<tbody>
+							{OPS.map((entry) => {
+								const row = rows[entry.id];
+								const busy = loading || row.saving || row.deleting;
+
+								return (
+									<tr key={entry.id} style={trStyle}>
+										<td style={tdStyle}>
+											<div style={opLabelStyle}>{entry.label}</div>
+											<div style={helperTextStyle}>{entry.desc}</div>
+										</td>
+										<td style={tdStyle}>{renderIntervalEditor(entry.id, row, busy)}</td>
+										<td style={tdStyle}>
+											<label style={toggleStyle}>
+												<input
+													type="checkbox"
+													checked={row.enabled}
+													disabled={busy}
+													onChange={(e) => setEnabledForOp(entry.id, e.target.checked)}
+												/>
+												<span>{row.enabled ? "Active" : "Paused"}</span>
+											</label>
+										</td>
+										<td style={tdStyle}>
+											<div style={timeValueStyle}>{formatScheduleTime(row.lastRunAt)}</div>
+										</td>
+										<td style={tdStyle}>
+											<div style={timeValueStyle}>{formatScheduleTime(row.nextRunAt)}</div>
+										</td>
+										<td style={tdStyle}>{renderStatusContent(row)}</td>
+										<td style={tdStyle}>{renderActionButtons(entry.id, row, busy)}</td>
+									</tr>
+								);
+							})}
+						</tbody>
+					</table>
+				</div>
+			)}
 		</div>
 	);
 }
@@ -374,6 +477,7 @@ export function MemorySchedular({ ship }: Props) {
 const wrapStyle: React.CSSProperties = {
 	padding: "12px 16px",
 	borderBottom: "1px solid #1e293b",
+	minWidth: 0,
 };
 
 const sectionLabelStyle: React.CSSProperties = {
@@ -523,6 +627,61 @@ const actionRowStyle: React.CSSProperties = {
 	marginTop: 12,
 	display: "flex",
 	gap: 8,
+	flexWrap: "wrap",
+};
+
+const statusBlockStyle: React.CSSProperties = {
+	display: "flex",
+	flexDirection: "column",
+	alignItems: "flex-start",
+	gap: 8,
+	minWidth: 0,
+};
+
+const compactListStyle: React.CSSProperties = {
+	display: "grid",
+	gap: 12,
+	gridTemplateColumns: "minmax(0, 1fr)",
+	paddingTop: 4,
+};
+
+const compactCardStyle: React.CSSProperties = {
+	borderRadius: 10,
+	border: "1px solid #1e293b",
+	background: "#08111f",
+	padding: 14,
+	minWidth: 0,
+};
+
+const compactHeaderStyle: React.CSSProperties = {
+	display: "flex",
+	justifyContent: "space-between",
+	alignItems: "flex-start",
+	gap: 12,
+	flexWrap: "wrap",
+};
+
+const compactGridStyle: React.CSSProperties = {
+	display: "grid",
+	gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+	gap: 12,
+	marginTop: 14,
+	minWidth: 0,
+};
+
+const compactFieldStyle: React.CSSProperties = {
+	display: "flex",
+	flexDirection: "column",
+	gap: 6,
+	minWidth: 0,
+};
+
+const compactFieldLabelStyle: React.CSSProperties = {
+	fontSize: 10,
+	fontWeight: 700,
+	letterSpacing: "0.06em",
+	textTransform: "uppercase",
+	color: "#64748b",
 };
 
 const primaryBtnStyle: React.CSSProperties = {

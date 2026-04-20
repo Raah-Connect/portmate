@@ -112,7 +112,7 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
       {/* ── Header ── */}
       <div style={cardHeaderStyle}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ fontSize: 20 }}>🚢</span>
+          <span style={{ fontSize: 20 }}>🛸</span>
           <div>
             <div style={{ fontWeight: 700, fontSize: 15, color: "#f1f5f9" }}>
               {ship.name}
@@ -201,7 +201,7 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
 
       {/* ── Panel: Memory Scheduler ── */}
       {activePanel === "memoryScheduler" && (
-        <div style={memoryPanelStyle}>
+        <div style={schedulerPanelStyle}>
           <MemorySchedular ship={ship} />
         </div>
       )}
@@ -339,6 +339,12 @@ const panelStyle: React.CSSProperties = {
 
 const memoryPanelStyle: React.CSSProperties = {
   borderBottom: "1px solid #1e293b",
+};
+
+const schedulerPanelStyle: React.CSSProperties = {
+  borderBottom: "1px solid #1e293b",
+  maxHeight: 520,
+  overflow: "auto",
 };
 
 const actionsStyle: React.CSSProperties = {
