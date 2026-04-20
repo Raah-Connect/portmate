@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::{collections::HashSet, path::PathBuf, sync::Mutex};
 use tauri::Manager;
 
 mod commands;
