@@ -35,6 +35,8 @@ type Panel = "terminal" | "memoryManager" | "memoryScheduler";
 export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
   const [activePanel, setActivePanel] = useState<Panel | null>(null);
   const [codeCopied, setCodeCopied]   = useState(false);
+  const [codeLoading, setCodeLoading] = useState(false);
+  const [accessCodeError, setAccessCodeError] = useState("");
   const [confirming, setConfirming]   = useState<"stop" | "delete" | null>(null);
   const [pierSizeBytes, setPierSizeBytes] = useState<number | null>(ship.pierSizeBytes ?? null);
   const [sizeRefreshing, setSizeRefreshing] = useState(false);
@@ -42,6 +44,20 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
   useEffect(() => {
     setPierSizeBytes(ship.pierSizeBytes ?? null);
   }, [ship.pierSizeBytes, ship.pierPath]);
+
+  useEffect(() => {
+    if (ship.accessCode) {
+      setCodeLoading(false);
+      setAccessCodeError("");
+    }
+  }, [ship.accessCode]);
+
+  useEffect(() => {
+    if (ship.status !== "running") {
+      setCodeLoading(false);
+      setAccessCodeError("");
+    }
+  }, [ship.status, ship.pierPath]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -68,6 +84,20 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
     navigator.clipboard.writeText(ship.accessCode);
     setCodeCopied(true);
     setTimeout(() => setCodeCopied(false), 15000);
+  }
+
+  async function requestAccessCode() {
+    if (ship.status !== "running" || ship.accessCode || codeLoading) return;
+
+    setAccessCodeError("");
+    setCodeLoading(true);
+    try {
+      await invoke("request_access_code", { pierPath: ship.pierPath });
+    } catch (error) {
+      console.error(error);
+      setAccessCodeError(String(error));
+      setCodeLoading(false);
+    }
   }
 
   function confirmThen(action: "stop" | "delete") {
@@ -106,6 +136,7 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
     running: "● Running",
     stopped: "○ Stopped",
   } as Record<string, string>)[ship.status] ?? ship.status;
+  const showGetAccessCode = ship.status === "running" && !ship.accessCode;
 
   return (
     <div style={cardStyle}>
@@ -152,16 +183,22 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
           </button>
         </div>
         <button
-          onClick={copyCode}
-          style={ship.accessCode ? codeBtnStyle : codeEmptyBtnStyle}
-          title={ship.accessCode ? "Click to copy access code" : "Access code not yet available"}
-          disabled={!ship.accessCode}
+          onClick={showGetAccessCode ? () => void requestAccessCode() : copyCode}
+          style={showGetAccessCode ? codeActionBtnStyle : ship.accessCode ? codeBtnStyle : codeEmptyBtnStyle}
+          title={ship.accessCode ? "Click to copy access code" : showGetAccessCode ? "Request the access code from dojo" : "Access code not yet available"}
+          disabled={showGetAccessCode ? codeLoading : !ship.accessCode}
         >
           <span style={{ fontFamily: "monospace", fontSize: 12 }}>
-            {codeCopied ? ship.accessCode : "🔑 Access Code"}
+            {showGetAccessCode ? codeLoading ? "Getting..." : "Get Access Code" : codeCopied ? ship.accessCode : "🔑 Access Code"}
           </span>
         </button>
       </div>
+
+      {accessCodeError && (
+        <div style={errorBannerStyle}>
+          {accessCodeError}
+        </div>
+      )}
 
       {/* ── Tab Bar ── */}
       <div style={tabBarStyle}>
@@ -279,6 +316,17 @@ const infoRowStyle: React.CSSProperties = {
   flexWrap: "wrap",
 };
 
+const errorBannerStyle: React.CSSProperties = {
+  margin: "10px 16px 0",
+  borderRadius: 8,
+  border: "1px solid #7f1d1d",
+  background: "#2b0b0b",
+  color: "#fecaca",
+  fontSize: 12,
+  lineHeight: 1.45,
+  padding: "8px 10px",
+};
+
 const sizeWrapStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
@@ -379,6 +427,13 @@ const codeEmptyBtnStyle: React.CSSProperties = {
   ...codeBtnStyle,
   opacity: 0.4,
   cursor: "not-allowed",
+};
+
+const codeActionBtnStyle: React.CSSProperties = {
+  ...codeBtnStyle,
+  background: "#0b2545",
+  color: "#bfdbfe",
+  border: "1px solid #1d4ed8",
 };
 
 const actionBtnStyle: React.CSSProperties = {

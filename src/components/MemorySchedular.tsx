@@ -5,11 +5,14 @@ import type { ShipInfo } from "./ShipCard";
 
 type OpId = "pack" | "meld" | "roll" | "chop";
 
+const DEFAULT_START_TIME = "03:00";
+
 interface MemorySchedule {
 	pierPath: string;
 	op: OpId;
 	intervalDays: number;
 	enabled: boolean;
+	startTime?: string | null;
 	lastRunAt?: number | null;
 	nextRunAt?: number | null;
 	lastStatus?: string | null;
@@ -24,6 +27,7 @@ interface MemoryScheduleUpdatedPayload {
 interface ScheduleRowState {
 	intervalDays: number;
 	enabled: boolean;
+	startTime: string;
 	hasSchedule: boolean;
 	saving: boolean;
 	deleting: boolean;
@@ -52,6 +56,7 @@ function createDefaultRowState(): ScheduleRowState {
 	return {
 		intervalDays: 7,
 		enabled: true,
+		startTime: DEFAULT_START_TIME,
 		hasSchedule: false,
 		saving: false,
 		deleting: false,
@@ -96,6 +101,7 @@ export function MemorySchedular({ ship }: Props) {
 					...createDefaultRowState(),
 					intervalDays: schedule.intervalDays,
 					enabled: schedule.enabled,
+					startTime: normalizeStartTime(schedule.startTime ?? DEFAULT_START_TIME),
 					hasSchedule: true,
 					lastRunAt: schedule.lastRunAt ?? null,
 					nextRunAt: schedule.nextRunAt ?? null,
@@ -195,15 +201,25 @@ export function MemorySchedular({ ship }: Props) {
 		}));
 	}
 
+	function setStartTimeForOp(op: OpId, startTime: string) {
+		updateRow(op, (current) => ({
+			...current,
+			startTime,
+			error: "",
+		}));
+	}
+
 	async function saveSchedule(op: OpId) {
 		const row = rows[op];
 		const safeInterval = Math.max(1, Math.floor(Number(row.intervalDays) || 1));
+		const safeStartTime = normalizeStartTime(row.startTime);
 
 		setError("");
 		setMessage("");
 		updateRow(op, (current) => ({
 			...current,
 			intervalDays: safeInterval,
+			startTime: safeStartTime,
 			saving: true,
 			lastError: "",
 			error: "",
@@ -216,6 +232,7 @@ export function MemorySchedular({ ship }: Props) {
 					op,
 					intervalDays: safeInterval,
 					enabled: row.enabled,
+						startTime: safeStartTime,
 				},
 			});
 
@@ -316,6 +333,19 @@ export function MemorySchedular({ ship }: Props) {
 		);
 	}
 
+	function renderStartTimeEditor(op: OpId, row: ScheduleRowState, busy: boolean) {
+		return (
+			<input
+				type="time"
+				step={60}
+				value={row.startTime}
+				onChange={(e) => setStartTimeForOp(op, normalizeStartTime(e.target.value))}
+				disabled={busy}
+				style={inputStyle}
+			/>
+		);
+	}
+
 	function renderStatusContent(row: ScheduleRowState) {
 		return (
 			<div style={statusBlockStyle}>
@@ -392,6 +422,10 @@ export function MemorySchedular({ ship }: Props) {
 										{renderIntervalEditor(entry.id, row, busy)}
 									</div>
 									<div style={compactFieldStyle}>
+										<div style={compactFieldLabelStyle}>Start time</div>
+										{renderStartTimeEditor(entry.id, row, busy)}
+									</div>
+									<div style={compactFieldStyle}>
 										<div style={compactFieldLabelStyle}>Enabled</div>
 										<label style={toggleStyle}>
 											<input
@@ -425,6 +459,7 @@ export function MemorySchedular({ ship }: Props) {
 							<tr>
 								<th style={thStyle}>Operation</th>
 								<th style={thStyle}>Every N days</th>
+								<th style={thStyle}>Start time</th>
 								<th style={thStyle}>Enabled</th>
 								<th style={thStyle}>Last run</th>
 								<th style={thStyle}>Next run</th>
@@ -444,6 +479,7 @@ export function MemorySchedular({ ship }: Props) {
 											<div style={helperTextStyle}>{entry.desc}</div>
 										</td>
 										<td style={tdStyle}>{renderIntervalEditor(entry.id, row, busy)}</td>
+										<td style={tdStyle}>{renderStartTimeEditor(entry.id, row, busy)}</td>
 										<td style={tdStyle}>
 											<label style={toggleStyle}>
 												<input
@@ -539,7 +575,7 @@ const tableWrapStyle: React.CSSProperties = {
 const tableStyle: React.CSSProperties = {
 	width: "100%",
 	borderCollapse: "collapse",
-	minWidth: 980,
+	minWidth: 1120,
 };
 
 const thStyle: React.CSSProperties = {
@@ -700,6 +736,8 @@ function statusPillStyle(running: boolean, lastStatus: string | null, hasSchedul
 		? { border: "#1d4ed8", background: "#0b2545", color: "#bfdbfe" }
 		: lastStatus === "success"
 			? { border: "#14532d", background: "#052e1a", color: "#86efac" }
+			: lastStatus === "waiting"
+				? { border: "#b45309", background: "#3b1d04", color: "#fdba74" }
 			: lastStatus === "error"
 				? { border: "#7f1d1d", background: "#2b0b0b", color: "#fecaca" }
 				: hasSchedule
@@ -740,6 +778,21 @@ function formatScheduleTime(timestamp: number | null): string {
 	}).format(new Date(timestamp * 1000));
 }
 
+function normalizeStartTime(value: string): string {
+	const match = value.match(/^(\d{1,2}):(\d{2})$/);
+	if (!match) {
+		return DEFAULT_START_TIME;
+	}
+
+	const hours = Number(match[1]);
+	const minutes = Number(match[2]);
+	if (!Number.isInteger(hours) || !Number.isInteger(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+		return DEFAULT_START_TIME;
+	}
+
+	return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
 function formatStatusLabel(row: ScheduleRowState): string {
 	if (!row.hasSchedule) {
 		return "Not set";
@@ -751,6 +804,10 @@ function formatStatusLabel(row: ScheduleRowState): string {
 
 	if (row.lastStatus === "success") {
 		return "Healthy";
+	}
+
+	if (row.lastStatus === "waiting") {
+		return "Waiting";
 	}
 
 	if (row.lastStatus === "error") {

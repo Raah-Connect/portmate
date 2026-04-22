@@ -28,6 +28,7 @@ reqwest = { version = "0.12", features = ["stream", "blocking"] }
 futures-util = "0.3"
 flate2 = "1.0"
 tar = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
  
 # libc is only needed on Unix for signal calls (kill, SIGKILL) in lib.rs and memory.rs.
 # Declaring it unconditionally would pull it into the Windows build unnecessarily

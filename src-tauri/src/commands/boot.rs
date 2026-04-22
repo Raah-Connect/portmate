@@ -7,6 +7,130 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{ShipInfo, ShipState};
 use crate::commands::ship_stats::refresh_ship_size;
+use super::memory_sched::ensure_default_memory_schedules_for_ship;
+
+pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopback_port: u16) {
+    thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let mut code = String::new();
+
+        for attempt in 1..=40 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+
+            let response = client
+                .post(format!("http://localhost:{}", loopback_port))
+                .header("Content-Type", "application/json")
+                .body(r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#)
+                .timeout(std::time::Duration::from_secs(5))
+                .send();
+
+            match response {
+                Ok(resp) => {
+                    let text = resp.text().unwrap_or_default();
+                    let candidate = text
+                        .trim()
+                        .trim_matches('"')
+                        .replace("\\n", "")
+                        .trim()
+                        .to_string();
+
+                    if !candidate.is_empty() {
+                        code = candidate;
+                        break;
+                    }
+
+                    let _ = app.emit(
+                        "ship-log",
+                        serde_json::json!({
+                            "line": format!("[lens] attempt {} — empty response, retrying…", attempt),
+                            "pier_path": &pier_path,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    let _ = app.emit(
+                        "ship-log",
+                        serde_json::json!({
+                            "line": format!("[lens] attempt {} — {}, retrying…", attempt, error),
+                            "pier_path": &pier_path,
+                        }),
+                    );
+                }
+            }
+        }
+
+        if !code.is_empty() {
+            let state = app.state::<ShipState>();
+            let mut ships = state.ships.lock().unwrap();
+            if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path) {
+                ship.access_code = code.clone();
+            }
+            drop(ships);
+            let _ = state.save();
+            let _ = app.emit(
+                "ship-code",
+                serde_json::json!({
+                    "pier_path": &pier_path,
+                    "code": code,
+                }),
+            );
+        } else {
+            let _ = app.emit(
+                "ship-log",
+                serde_json::json!({
+                    "line": "[lens] gave up after 40 attempts — could not retrieve access code",
+                    "pier_path": &pier_path,
+                }),
+            );
+        }
+    });
+}
+
+#[tauri::command]
+pub fn request_access_code(
+    pier_path: String,
+    app: AppHandle,
+    state: State<'_, ShipState>,
+) -> Result<(), String> {
+    let ship = state
+        .ships
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|ship| ship.pier_path == pier_path)
+        .cloned()
+        .ok_or_else(|| "No ship found at that path".to_string())?;
+
+    if ship.status != "running" {
+        return Err("Ship must be running to request an access code".to_string());
+    }
+
+    if !ship.access_code.trim().is_empty() {
+        let _ = app.emit(
+            "ship-code",
+            serde_json::json!({
+                "pier_path": pier_path,
+                "code": ship.access_code,
+            }),
+        );
+        return Ok(());
+    }
+
+    let loopback_port = ship
+        .loopback_port
+        .ok_or_else(|| "Loopback dojo port is not available for this ship yet".to_string())?;
+
+    let _ = app.emit(
+        "ship-log",
+        serde_json::json!({
+            "line": "[portmate] Requesting access code via +code…",
+            "pier_path": &pier_path,
+        }),
+    );
+
+    spawn_access_code_fetch(app, pier_path, loopback_port);
+    Ok(())
+}
 
 // ── Platform ──────────────────────────────────────────────────────────────────
 
@@ -193,12 +317,14 @@ pub fn boot_comet(
     let stdin = child.stdin.take().unwrap();
 
     // Add or update ship in the list
-    {
+    let created_ship = {
         let mut ships = state.ships.lock().unwrap();
         if let Some(existing) = ships.iter_mut().find(|s| s.pier_path == pier_path) {
             existing.status = "booting".to_string();
             existing.pid = Some(pid);
             existing.url = String::new();
+            existing.loopback_port = None;
+            false
         } else {
             ships.push(ShipInfo {
                 name: comet_name.clone(),
@@ -208,12 +334,23 @@ pub fn boot_comet(
                 status: "booting".to_string(),
                 binary_path: binary_path.clone(),
                 pid: Some(pid),
+                loopback_port: None,
                 pier_size_bytes: None,
             });
+            true
         }
-    }
+    };
     let _ = state.save();
     let _ = refresh_ship_size(&pier_path, &app, &state);
+
+    if created_ship {
+        if let Err(error) = ensure_default_memory_schedules_for_ship(&app, &state, &pier_path) {
+            eprintln!(
+                "[portmate] Failed to seed default maintenance schedules for {}: {}",
+                pier_path, error
+            );
+        }
+    }
 
     // Stdin writer thread
     let (tx, rx) = mpsc::channel::<String>();
@@ -251,6 +388,16 @@ pub fn boot_comet(
 
                     if line.contains("loopback live on") {
                         loopback_port = parse_port(&line);
+                        if let Some(port) = loopback_port {
+                            let state = app_out.state::<ShipState>();
+                            let mut ships = state.ships.lock().unwrap();
+                            if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path_out)
+                            {
+                                ship.loopback_port = Some(port);
+                            }
+                            drop(ships);
+                            let _ = state.save();
+                        }
                     }
 
                     if line.contains("web interface live on") {
@@ -291,83 +438,7 @@ pub fn boot_comet(
                             12321
                         });
 
-                        let app_lens = app_out.clone();
-                        let pier_path_lens = pier_path_out.clone();
-                        thread::spawn(move || {
-                            let client = reqwest::blocking::Client::new();
-                            let mut code = String::new();
-
-                            for attempt in 1..=40 {
-                                std::thread::sleep(std::time::Duration::from_secs(3));
-
-                                let res = client
-                                    .post(format!("http://localhost:{}", port))
-                                    .header("Content-Type", "application/json")
-                                    .body(r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#)
-                                    .timeout(std::time::Duration::from_secs(5))
-                                    .send();
-
-                                match res {
-                                    Ok(resp) => {
-                                        let text = resp.text().unwrap_or_default();
-                                        let candidate = text
-                                            .trim()
-                                            .trim_matches('"')
-                                            .replace("\\n", "")
-                                            .trim()
-                                            .to_string();
-
-                                        if !candidate.is_empty() {
-                                            code = candidate;
-                                            break;
-                                        }
-                                        let _ = app_lens.emit(
-                                            "ship-log",
-                                            serde_json::json!({
-                                                "line": format!("[lens] attempt {} — empty response, retrying…", attempt),
-                                                "pier_path": pier_path_lens,
-                                            }),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let _ = app_lens.emit(
-                                            "ship-log",
-                                            serde_json::json!({
-                                                "line": format!("[lens] attempt {} — {}, retrying…", attempt, e),
-                                                "pier_path": pier_path_lens,
-                                            }),
-                                        );
-                                    }
-                                }
-                            }
-
-                            if !code.is_empty() {
-                                let state = app_lens.state::<ShipState>();
-                                let mut ships = state.ships.lock().unwrap();
-                                if let Some(ship) =
-                                    ships.iter_mut().find(|s| s.pier_path == pier_path_lens)
-                                {
-                                    ship.access_code = code.clone();
-                                }
-                                drop(ships);
-                                let _ = state.save();
-                                let _ = app_lens.emit(
-                                    "ship-code",
-                                    serde_json::json!({
-                                        "pier_path": pier_path_lens,
-                                        "code":      code,
-                                    }),
-                                );
-                            } else {
-                                let _ = app_lens.emit(
-                                    "ship-log",
-                                    serde_json::json!({
-                                        "line": "[lens] gave up after 40 attempts — could not retrieve access code",
-                                        "pier_path": pier_path_lens,
-                                    }),
-                                );
-                            }
-                        });
+                        spawn_access_code_fetch(app_out.clone(), pier_path_out.clone(), port);
                     }
                 }
                 Err(_) => break,

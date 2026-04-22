@@ -1,3 +1,7 @@
+use chrono::{DateTime, Duration as ChronoDuration, Local, LocalResult, TimeZone, Timelike};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,8 +11,16 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use super::memory::run_scheduled_memory_op;
 use crate::ShipState;
 
-const DAY_SECONDS: i64 = 24 * 60 * 60;
 const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const BUSY_RETRY_MIN_SECONDS: i64 = 90;
+const BUSY_RETRY_JITTER_SECONDS: u64 = 30;
+const DEFAULT_START_TIME: &str = "03:00";
+const DEFAULT_SHIP_SCHEDULES: [(&str, &str); 4] = [
+    ("pack", "00:00"),
+    ("meld", "01:00"),
+    ("roll", "02:00"),
+    ("chop", "03:00"),
+];
 
 // ── Schedule model ────────────────────────────────────────────────────────────
 
@@ -19,6 +31,8 @@ pub struct MemorySchedule {
     pub op: String,
     pub interval_days: u32,
     pub enabled: bool,
+    #[serde(default)]
+    pub start_time: String,
     #[serde(default)]
     pub last_run_at: Option<i64>,
     #[serde(default)]
@@ -76,6 +90,10 @@ fn normalize_op(op: &str) -> Option<String> {
 
 fn normalize_loaded_schedule(mut schedule: MemorySchedule) -> Option<MemorySchedule> {
     schedule.op = normalize_op(&schedule.op)?;
+    schedule.start_time = normalize_start_time(&schedule.start_time)
+        .or_else(|| schedule.next_run_at.and_then(start_time_from_timestamp))
+        .or_else(|| schedule.last_run_at.and_then(start_time_from_timestamp))
+        .unwrap_or_else(default_schedule_start_time);
 
     if schedule.last_status.as_deref() == Some("running") {
         schedule.last_status = Some("error".to_string());
@@ -87,7 +105,12 @@ fn normalize_loaded_schedule(mut schedule: MemorySchedule) -> Option<MemorySched
     schedule.running = false;
     if schedule.enabled {
         if schedule.next_run_at.is_none() {
-            schedule.next_run_at = compute_next_run_at(schedule.last_run_at, schedule.interval_days, true);
+            schedule.next_run_at = compute_next_run_at(
+                schedule.last_run_at,
+                schedule.interval_days,
+                true,
+                &schedule.start_time,
+            );
         }
     } else {
         schedule.next_run_at = None;
@@ -103,13 +126,105 @@ fn now_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-fn compute_next_run_at(last_run_at: Option<i64>, interval_days: u32, enabled: bool) -> Option<i64> {
+fn default_schedule_start_time() -> String {
+    DEFAULT_START_TIME.to_string()
+}
+
+fn parse_start_time(start_time: &str) -> Option<(u32, u32)> {
+    let mut parts = start_time.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+
+    if parts.next().is_some() || hour > 23 || minute > 59 {
+        return None;
+    }
+
+    Some((hour, minute))
+}
+
+fn normalize_start_time(start_time: &str) -> Option<String> {
+    let (hour, minute) = parse_start_time(start_time)?;
+    Some(format!("{hour:02}:{minute:02}"))
+}
+
+fn local_datetime_from_timestamp(timestamp: i64) -> Option<DateTime<Local>> {
+    match Local.timestamp_opt(timestamp, 0) {
+        LocalResult::Single(datetime) => Some(datetime),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        LocalResult::None => None,
+    }
+}
+
+fn start_time_from_timestamp(timestamp: i64) -> Option<String> {
+    let datetime = local_datetime_from_timestamp(timestamp)?;
+    Some(format!("{:02}:{:02}", datetime.hour(), datetime.minute()))
+}
+
+fn resolve_local_timestamp(date: chrono::NaiveDate, hour: u32, minute: u32) -> Option<i64> {
+    let local_time = date.and_hms_opt(hour, minute, 0)?;
+
+    for offset_minutes in 0..=120 {
+        let candidate = local_time + ChronoDuration::minutes(i64::from(offset_minutes));
+        match Local.from_local_datetime(&candidate) {
+            LocalResult::Single(datetime) => return Some(datetime.timestamp()),
+            LocalResult::Ambiguous(earliest, _) => return Some(earliest.timestamp()),
+            LocalResult::None => continue,
+        }
+    }
+
+    None
+}
+
+fn compute_next_run_at(
+    last_run_at: Option<i64>,
+    interval_days: u32,
+    enabled: bool,
+    start_time: &str,
+) -> Option<i64> {
     if !enabled {
         return None;
     }
 
-    let base = last_run_at.unwrap_or_else(now_timestamp);
-    Some(base + i64::from(interval_days) * DAY_SECONDS)
+    let normalized_start_time = normalize_start_time(start_time).unwrap_or_else(default_schedule_start_time);
+    let (hour, minute) = parse_start_time(&normalized_start_time)?;
+
+    if let Some(last_run_at) = last_run_at {
+        let last_run = local_datetime_from_timestamp(last_run_at)?;
+        let next_date = last_run
+            .date_naive()
+            .checked_add_signed(ChronoDuration::days(i64::from(interval_days)))?;
+
+        return resolve_local_timestamp(next_date, hour, minute);
+    }
+
+    let now = Local::now();
+    let today = now.date_naive();
+    let today_at_start_time = resolve_local_timestamp(today, hour, minute)?;
+
+    if today_at_start_time >= now.timestamp() {
+        return Some(today_at_start_time);
+    }
+
+    let next_date = today.checked_add_signed(ChronoDuration::days(1))?;
+    resolve_local_timestamp(next_date, hour, minute)
+}
+
+fn compute_busy_retry_at(now: i64, pier_path: &str, op: &str) -> i64 {
+    let mut hasher = DefaultHasher::new();
+    pier_path.hash(&mut hasher);
+    op.hash(&mut hasher);
+    now.hash(&mut hasher);
+
+    let jitter = (hasher.finish() % (BUSY_RETRY_JITTER_SECONDS + 1)) as i64;
+    now + BUSY_RETRY_MIN_SECONDS + jitter
+}
+
+fn is_ship_busy_error(error: &str) -> bool {
+    let error = error.to_lowercase();
+    error.contains("maintenance already running")
+        || error.contains("already running")
+        || error.contains("already busy")
+        || error.contains("in progress")
 }
 
 fn get_schedule_index(schedules: &[MemorySchedule], pier_path: &str, op: &str) -> Option<usize> {
@@ -121,6 +236,48 @@ fn get_schedule_index(schedules: &[MemorySchedule], pier_path: &str, op: &str) -
 fn ship_exists(state: &State<'_, ShipState>, pier_path: &str) -> bool {
     let ships = state.ships.lock().unwrap();
     ships.iter().any(|s| s.pier_path == pier_path)
+}
+
+pub fn ensure_default_memory_schedules_for_ship(
+    app: &AppHandle,
+    state: &State<'_, ShipState>,
+    pier_path: &str,
+) -> Result<(), String> {
+    let mut schedules = state.memory_schedules.lock().unwrap();
+    let mut added_ops = Vec::new();
+
+    for (op, start_time) in DEFAULT_SHIP_SCHEDULES {
+        if get_schedule_index(&schedules, pier_path, op).is_some() {
+            continue;
+        }
+
+        schedules.push(MemorySchedule {
+            pier_path: pier_path.to_string(),
+            op: op.to_string(),
+            interval_days: 1,
+            enabled: true,
+            start_time: start_time.to_string(),
+            last_run_at: None,
+            next_run_at: compute_next_run_at(None, 1, true, start_time),
+            last_status: None,
+            last_error: None,
+            running: false,
+        });
+        added_ops.push(op.to_string());
+    }
+
+    if added_ops.is_empty() {
+        return Ok(());
+    }
+
+    persist_schedules(state, &schedules)?;
+    drop(schedules);
+
+    for op in added_ops {
+        emit_schedule_updated(app, pier_path, Some(&op));
+    }
+
+    Ok(())
 }
 
 fn emit_schedule_updated(app: &AppHandle, pier_path: &str, op: Option<&str>) {
@@ -141,6 +298,41 @@ fn emit_ship_log(app: &AppHandle, pier_path: &str, line: &str) {
     );
 }
 
+fn mark_schedule_waiting(
+    app: &AppHandle,
+    pier_path: &str,
+    op: &str,
+    retry_at: i64,
+) -> Result<(), String> {
+    let Some(op) = normalize_op(op) else {
+        return Ok(());
+    };
+
+    let state = app.state::<ShipState>();
+    let mut schedules = state.memory_schedules.lock().unwrap();
+    let Some(index) = get_schedule_index(&schedules, pier_path, &op) else {
+        return Ok(());
+    };
+
+    let schedule = &mut schedules[index];
+    schedule.running = false;
+    schedule.last_status = Some("waiting".to_string());
+    schedule.last_error = None;
+    schedule.next_run_at = Some(retry_at);
+
+    persist_schedules(&state, &schedules)?;
+    drop(schedules);
+    emit_schedule_updated(app, pier_path, Some(&op));
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct ClaimedSchedules {
+    due: Vec<MemorySchedule>,
+    waiting: Vec<(MemorySchedule, i64)>,
+}
+
 // ── Scheduler runtime ─────────────────────────────────────────────────────────
 
 pub fn start_memory_scheduler_loop(app: AppHandle) {
@@ -153,9 +345,21 @@ pub fn start_memory_scheduler_loop(app: AppHandle) {
 }
 
 fn run_scheduler_tick(app: &AppHandle) -> Result<(), String> {
-    let due_schedules = claim_due_schedules(app)?;
+    let claimed = claim_due_schedules(app)?;
 
-    for schedule in due_schedules {
+    for (schedule, retry_at) in &claimed.waiting {
+        let retry_in = (*retry_at - now_timestamp()).max(BUSY_RETRY_MIN_SECONDS);
+        emit_ship_log(
+            app,
+            &schedule.pier_path,
+            &format!(
+                "[portmate] Scheduled {} is waiting for the ship to become free; retrying in about {}s",
+                schedule.op, retry_in
+            ),
+        );
+    }
+
+    for schedule in claimed.due {
         emit_ship_log(
             app,
             &schedule.pier_path,
@@ -171,6 +375,20 @@ fn run_scheduler_tick(app: &AppHandle) -> Result<(), String> {
             app.clone(),
             app.state(),
         ) {
+            if is_ship_busy_error(&error) {
+                let retry_at = compute_busy_retry_at(now_timestamp(), &schedule.pier_path, &schedule.op);
+                mark_schedule_waiting(app, &schedule.pier_path, &schedule.op, retry_at)?;
+                emit_ship_log(
+                    app,
+                    &schedule.pier_path,
+                    &format!(
+                        "[portmate] Scheduled {} is waiting for the ship to become free; retrying soon",
+                        schedule.op
+                    ),
+                );
+                continue;
+            }
+
             emit_ship_log(
                 app,
                 &schedule.pier_path,
@@ -183,12 +401,13 @@ fn run_scheduler_tick(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn claim_due_schedules(app: &AppHandle) -> Result<Vec<MemorySchedule>, String> {
+fn claim_due_schedules(app: &AppHandle) -> Result<ClaimedSchedules, String> {
     let state = app.state::<ShipState>();
     let now = now_timestamp();
     let active_memory_ops = state.active_memory_ops.lock().unwrap().clone();
+    let mut busy_ships: HashSet<String> = active_memory_ops;
     let mut schedules = state.memory_schedules.lock().unwrap();
-    let mut due_schedules = Vec::new();
+    let mut claimed = ClaimedSchedules::default();
     let mut changed = false;
 
     for schedule in schedules.iter_mut() {
@@ -200,14 +419,26 @@ fn claim_due_schedules(app: &AppHandle) -> Result<Vec<MemorySchedule>, String> {
             continue;
         };
 
-        if next_run_at > now || active_memory_ops.contains(&schedule.pier_path) {
+        if next_run_at > now {
+            continue;
+        }
+
+        if busy_ships.contains(&schedule.pier_path) {
+            let retry_at = compute_busy_retry_at(now, &schedule.pier_path, &schedule.op);
+            schedule.running = false;
+            schedule.last_status = Some("waiting".to_string());
+            schedule.last_error = None;
+            schedule.next_run_at = Some(retry_at);
+            claimed.waiting.push((schedule.clone(), retry_at));
+            changed = true;
             continue;
         }
 
         schedule.running = true;
         schedule.last_status = Some("running".to_string());
         schedule.last_error = None;
-        due_schedules.push(schedule.clone());
+        busy_ships.insert(schedule.pier_path.clone());
+        claimed.due.push(schedule.clone());
         changed = true;
     }
 
@@ -217,11 +448,15 @@ fn claim_due_schedules(app: &AppHandle) -> Result<Vec<MemorySchedule>, String> {
 
     drop(schedules);
 
-    for schedule in &due_schedules {
+    for schedule in &claimed.due {
         emit_schedule_updated(app, &schedule.pier_path, Some(&schedule.op));
     }
 
-    Ok(due_schedules)
+    for (schedule, _) in &claimed.waiting {
+        emit_schedule_updated(app, &schedule.pier_path, Some(&schedule.op));
+    }
+
+    Ok(claimed)
 }
 
 pub fn mark_schedule_running(app: &AppHandle, pier_path: &str, op: &str) {
@@ -268,7 +503,12 @@ pub fn record_schedule_result(
     schedule.last_run_at = Some(completed_at);
     schedule.last_status = Some(if success { "success" } else { "error" }.to_string());
     schedule.last_error = if success { None } else { error };
-    schedule.next_run_at = compute_next_run_at(Some(completed_at), schedule.interval_days, schedule.enabled);
+    schedule.next_run_at = compute_next_run_at(
+        Some(completed_at),
+        schedule.interval_days,
+        schedule.enabled,
+        &schedule.start_time,
+    );
 
     if persist_schedules(&state, &schedules).is_ok() {
         drop(schedules);
@@ -342,6 +582,9 @@ pub fn set_memory_schedule(
     let mut schedules = state.memory_schedules.lock().unwrap();
     let existing = get_schedule_index(&schedules, &schedule.pier_path, &op)
         .map(|index| schedules[index].clone());
+    let start_time = normalize_start_time(&schedule.start_time)
+        .or_else(|| existing.as_ref().and_then(|item| normalize_start_time(&item.start_time)))
+        .unwrap_or_else(default_schedule_start_time);
 
     let next_run_at = if existing.as_ref().is_some_and(|item| item.running) {
         existing.as_ref().and_then(|item| item.next_run_at)
@@ -350,6 +593,7 @@ pub fn set_memory_schedule(
             existing.as_ref().and_then(|item| item.last_run_at),
             schedule.interval_days,
             schedule.enabled,
+            &start_time,
         )
     };
 
@@ -358,6 +602,7 @@ pub fn set_memory_schedule(
         op: op.clone(),
         interval_days: schedule.interval_days,
         enabled: schedule.enabled,
+        start_time,
         last_run_at: existing.as_ref().and_then(|item| item.last_run_at),
         next_run_at,
         last_status: existing.as_ref().and_then(|item| item.last_status.clone()),

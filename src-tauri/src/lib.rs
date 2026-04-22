@@ -5,7 +5,7 @@ mod commands;
 
 use commands::boot::{
     boot_comet, delete_ship, download_urbit, get_platform_info, get_running_ships, is_ship_running,
-    restart_ship, send_dojo, stop_ship,
+    request_access_code, restart_ship, send_dojo, stop_ship,
 };
 use commands::boot_existing::boot_existing;
 use commands::boot_key::boot_key;
@@ -29,6 +29,9 @@ pub struct ShipInfo {
     pub status: String,
     pub binary_path: String,
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub loopback_port: Option<u16>,
+    #[serde(default)]
     pub pier_size_bytes: Option<u64>,
 }
 
@@ -213,6 +216,7 @@ pub fn run() {
             delete_ship,
             is_ship_running,
             get_running_ships,
+            request_access_code,
             // memory management
             pack_ship,
             meld_ship,
