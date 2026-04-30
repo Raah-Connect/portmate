@@ -7,7 +7,7 @@ use super::boot::restart_ship_internal;
 use super::memory_sched::{mark_schedule_running, record_schedule_result};
 use crate::ShipState;
 
-// ── All four ops are offline: stop → run binary → emit memory-op-done ─────────
+// ── Memory operations entry points ────────────────────────────────────────────
 
 #[tauri::command]
 pub fn pack_ship(
@@ -93,7 +93,10 @@ fn run_memory_op(
 
     mark_schedule_running(&app, &pier_path, &op);
 
-    stop_for_maintenance(&pier_path, &app, &state);
+    let run_online = use_online_pack_meld_path(&op, &pier_path, &state);
+    if !run_online {
+        stop_for_maintenance(&pier_path, &app, &state);
+    }
 
     let app2 = app.clone();
     let path2 = pier_path.clone();
@@ -101,28 +104,79 @@ fn run_memory_op(
         let mut success = false;
         let mut error_message: Option<String> = None;
 
-        emit_log(
-            &app2,
-            &path2,
-            &format!("[portmate] Starting {op} on '{pier_name}' — this may take a few minutes…"),
-        );
-        match run_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
-            Ok(()) => {
-                emit_log(&app2, &path2, &format!("[portmate] {op} complete ✓"));
-                success = true;
+        if run_online {
+            emit_log(
+                &app2,
+                &path2,
+                &format!("[portmate] Starting online {op} on '{pier_name}' via conn.sock…"),
+            );
+            match run_online_pack_meld(&op, &binary, &path2, &app2) {
+                Ok(()) => {
+                    emit_log(&app2, &path2, &format!("[portmate] online {op} complete ✓"));
+                    success = true;
+                }
+                Err(e) => {
+                    emit_log(&app2, &path2, &format!("[portmate] online {op} failed: {e}"));
+                    emit_log(
+                        &app2,
+                        &path2,
+                        &format!("[portmate] online {op} failed; falling back to offline maintenance mode…"),
+                    );
 
-                if restart_after {
-                    emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
-                    if let Err(error) = restart_ship_internal(path2.clone(), app2.clone(), app2.state()) {
-                        emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
-                        success = false;
-                        error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
+                    let state2 = app2.state::<ShipState>();
+                    stop_for_maintenance(&path2, &app2, &state2);
+
+                    match run_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
+                        Ok(()) => {
+                            emit_log(&app2, &path2, &format!("[portmate] offline {op} complete ✓"));
+                            success = true;
+
+                            if restart_after {
+                                emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
+                                if let Err(error) = restart_ship_internal(path2.clone(), app2.clone(), app2.state()) {
+                                    emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
+                                    success = false;
+                                    error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
+                                }
+                            }
+                        }
+                        Err(fallback_error) => {
+                            emit_log(
+                                &app2,
+                                &path2,
+                                &format!("[portmate] offline fallback {op} failed: {fallback_error}"),
+                            );
+                            error_message = Some(format!(
+                                "Online {op} failed: {e}; offline fallback failed: {fallback_error}"
+                            ));
+                        }
                     }
                 }
             }
-            Err(e) => {
-                emit_log(&app2, &path2, &format!("[portmate] {op} failed: {e}"));
-                error_message = Some(e);
+        } else {
+            emit_log(
+                &app2,
+                &path2,
+                &format!("[portmate] Starting {op} on '{pier_name}' — this may take a few minutes…"),
+            );
+            match run_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
+                Ok(()) => {
+                    emit_log(&app2, &path2, &format!("[portmate] {op} complete ✓"));
+                    success = true;
+
+                    if restart_after {
+                        emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
+                        if let Err(error) = restart_ship_internal(path2.clone(), app2.clone(), app2.state()) {
+                            emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
+                            success = false;
+                            error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    emit_log(&app2, &path2, &format!("[portmate] {op} failed: {e}"));
+                    error_message = Some(e);
+                }
             }
         }
 
@@ -180,6 +234,115 @@ fn binary_for(pier_path: &str, state: &State<'_, ShipState>) -> Result<String, S
         .find(|s| s.pier_path == pier_path)
         .map(|s| s.binary_path.clone())
         .ok_or_else(|| format!("No ship found at {pier_path}"))
+}
+
+#[cfg(unix)]
+fn ship_looks_running(pier_path: &str, state: &State<'_, ShipState>) -> bool {
+    let lock = std::path::Path::new(pier_path).join(".urb").join("lock");
+    let in_table = state
+        .processes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p == pier_path);
+    let has_stdin_tx = state
+        .stdin_txs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p == pier_path);
+    let lock_alive = lock.exists()
+        && std::fs::read_to_string(&lock)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(is_pid_alive)
+            .unwrap_or(false);
+
+    in_table || has_stdin_tx || lock_alive
+}
+
+#[cfg(unix)]
+fn use_online_pack_meld_path(op: &str, pier_path: &str, state: &State<'_, ShipState>) -> bool {
+    matches!(op, "pack" | "meld") && ship_looks_running(pier_path, state)
+}
+
+#[cfg(not(unix))]
+fn use_online_pack_meld_path(_op: &str, _pier_path: &str, _state: &State<'_, ShipState>) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn run_online_pack_meld(
+    op: &str,
+    binary: &str,
+    pier_path: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let conn_sock = std::path::Path::new(pier_path).join(".urb").join("conn.sock");
+    if !conn_sock.exists() {
+        return Err(format!(
+            "No conn.sock found at {}. Is the ship running?",
+            conn_sock.display()
+        ));
+    }
+
+    let payload = format!("[0 %urth %{op}]");
+    let binary_q = shell_single_quote(binary);
+    let sock_q = shell_single_quote(&conn_sock.to_string_lossy());
+    let payload_q = shell_single_quote(&payload);
+    let pipeline = format!(
+        "echo {payload_q} | {binary_q} eval -jn | nc -U -w 1 {sock_q} | {binary_q} eval -cn"
+    );
+
+    emit_log(app, pier_path, &format!("[portmate] Running: {pipeline}"));
+
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-lc", &pipeline])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start online `{op}` pipeline: {e}"))?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    let app_out = app.clone();
+    let pier_out = pier_path.to_string();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().flatten() {
+            emit_log(&app_out, &pier_out, &line);
+        }
+    });
+
+    let app_err = app.clone();
+    let pier_err = pier_path.to_string();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().flatten() {
+            emit_log(&app_err, &pier_err, &format!("[stderr] {line}"));
+        }
+    });
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("online `{op}` pipeline exited with {status}"))
+    }
+}
+
+#[cfg(not(unix))]
+fn run_online_pack_meld(
+    _op: &str,
+    _binary: &str,
+    _pier_path: &str,
+    _app: &AppHandle,
+) -> Result<(), String> {
+    Err("online pack/meld only supported on Unix".to_string())
 }
 
 /// Returns true if any live process has `pier_path` in its command line.
