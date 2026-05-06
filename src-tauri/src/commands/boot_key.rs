@@ -320,6 +320,14 @@ pub async fn boot_key(
                         let _ = state.save();
 
                         let _ = app_out.emit(
+                            "ship-log",
+                            serde_json::json!({
+                                "line": format!("[portmate] Ship URL {}", url),
+                                "pier_path": pier_path_out,
+                            }),
+                        );
+
+                        let _ = app_out.emit(
                             "ship-ready",
                             serde_json::json!({
                                 "pier_path": pier_path_out,
@@ -356,6 +364,8 @@ pub async fn boot_key(
         if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path_out) {
             ship.status = "stopped".to_string();
             ship.pid = None;
+            ship.url = String::new();
+            ship.loopback_port = None;
         }
         drop(ships);
         let _ = state.save();

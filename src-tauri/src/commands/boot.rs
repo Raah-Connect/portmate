@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::{ShipInfo, ShipState};
 use crate::commands::ship_stats::refresh_ship_size;
 use super::memory_sched::ensure_default_memory_schedules_for_ship;
+use super::urbit_http::{install_exit_hook, stop_ship_graceful};
 
 pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopback_port: u16) {
     thread::spawn(move || {
@@ -416,6 +417,14 @@ pub fn boot_comet(
                         let _ = refresh_ship_size(&pier_path_out, &app_out, &state);
 
                         let _ = app_out.emit(
+                            "ship-log",
+                            serde_json::json!({
+                                "line": format!("[portmate] Ship URL {}", url),
+                                "pier_path": pier_path_out,
+                            }),
+                        );
+
+                        let _ = app_out.emit(
                             "ship-ready",
                             serde_json::json!({
                                 "pier_path": pier_path_out,
@@ -438,6 +447,12 @@ pub fn boot_comet(
                             12321
                         });
 
+                        let app_http = app_out.clone();
+                        let pier_http = pier_path_out.clone();
+                        thread::spawn(move || {
+                            install_exit_hook(&app_http, &pier_http, port);
+                        });
+
                         spawn_access_code_fetch(app_out.clone(), pier_path_out.clone(), port);
                     }
                 }
@@ -451,6 +466,8 @@ pub fn boot_comet(
         if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path_out) {
             ship.status = "stopped".to_string();
             ship.pid = None;
+            ship.url = String::new();
+            ship.loopback_port = None;
         }
         drop(ships);
         let _ = state.save();
@@ -513,10 +530,59 @@ pub fn stop_ship(
     app: AppHandle,
     state: State<'_, ShipState>,
 ) -> Result<(), String> {
+    let ship_snapshot = state
+        .ships
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| s.pier_path == pier_path)
+        .cloned();
+
+    if let Some(ship) = ship_snapshot {
+        if let (Some(port), code) = (ship.loopback_port, ship.access_code.clone()) {
+            if !code.trim().is_empty() {
+                match stop_ship_graceful(&ship.pier_path, port, &code, &ship.name) {
+                    Ok(()) => {
+                        let _ = app.emit(
+                            "ship-log",
+                            serde_json::json!({
+                                "line": "[portmate] Sent graceful shutdown via exit-hook",
+                                "pier_path": &pier_path,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "ship-log",
+                            serde_json::json!({
+                                "line": format!("[portmate] Graceful shutdown failed: {e}; falling back to kill"),
+                                "pier_path": &pier_path,
+                            }),
+                        );
+                    }
+                }
+
+                for _ in 0..20 {
+                    if !state.verify_ship_status(&pier_path) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    }
+
     let mut processes = state.processes.lock().unwrap();
     if let Some(pos) = processes.iter().position(|(p, _)| p == &pier_path) {
         let (_, mut child) = processes.remove(pos);
-        child.kill().map_err(|e| e.to_string())?;
+        let still_running = child
+            .try_wait()
+            .map_err(|e| format!("Failed to inspect process state: {e}"))?
+            .is_none();
+
+        if still_running {
+            let _ = child.kill();
+        }
     }
     drop(processes);
 
@@ -526,6 +592,8 @@ pub fn stop_ship(
     if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path) {
         ship.status = "stopped".to_string();
         ship.pid = None;
+        ship.url = String::new();
+        ship.loopback_port = None;
     }
     drop(ships);
     let _ = state.save();

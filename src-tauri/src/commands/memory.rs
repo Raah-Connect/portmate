@@ -94,8 +94,13 @@ fn run_memory_op(
     mark_schedule_running(&app, &pier_path, &op);
 
     let run_online = use_online_pack_meld_path(&op, &pier_path, &state);
-    if !run_online {
-        stop_for_maintenance(&pier_path, &app, &state);
+    if !run_online
+        && !stop_for_maintenance(&pier_path, &app, &state)
+    {
+        finish_active_memory_op(&state, &pier_path);
+        return Err(format!(
+            "Could not fully stop ship before {op}; aborting maintenance to avoid locked pier"
+        ));
     }
 
     let app2 = app.clone();
@@ -124,16 +129,34 @@ fn run_memory_op(
                     );
 
                     let state2 = app2.state::<ShipState>();
-                    stop_for_maintenance(&path2, &app2, &state2);
+                    if !stop_for_maintenance(&path2, &app2, &state2) {
+                        let message = format!(
+                            "Could not fully stop ship before offline fallback {op}; aborting maintenance"
+                        );
+                        emit_log(&app2, &path2, &format!("[portmate] {message}"));
+                        error_message = Some(message);
+                        record_schedule_result(&app2, &path2, &op, false, error_message.clone());
+                        finish_active_memory_op(&app2.state::<ShipState>(), &path2);
+                        let _ = app2.emit(
+                            "memory-op-done",
+                            serde_json::json!({
+                                "pier_path": path2,
+                                "op":        op,
+                                "success":   false,
+                                "error":     error_message,
+                            }),
+                        );
+                        return;
+                    }
 
-                    match run_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
+                    match run_maintenance_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
                         Ok(()) => {
                             emit_log(&app2, &path2, &format!("[portmate] offline {op} complete ✓"));
                             success = true;
 
                             if restart_after {
                                 emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
-                                if let Err(error) = restart_ship_internal(path2.clone(), app2.clone(), app2.state()) {
+                                if let Err(error) = restart_ship_after_maintenance(path2.clone(), &app2) {
                                     emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
                                     success = false;
                                     error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
@@ -159,14 +182,14 @@ fn run_memory_op(
                 &path2,
                 &format!("[portmate] Starting {op} on '{pier_name}' — this may take a few minutes…"),
             );
-            match run_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
+            match run_maintenance_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
                 Ok(()) => {
                     emit_log(&app2, &path2, &format!("[portmate] {op} complete ✓"));
                     success = true;
 
                     if restart_after {
                         emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
-                        if let Err(error) = restart_ship_internal(path2.clone(), app2.clone(), app2.state()) {
+                        if let Err(error) = restart_ship_after_maintenance(path2.clone(), &app2) {
                             emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
                             success = false;
                             error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
@@ -359,11 +382,23 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
 
 #[cfg(windows)]
 fn any_urbit_process_alive(pier_path: &str) -> bool {
-    // Use PowerShell to search for the pier path in process command lines.
-    // wmic is deprecated in Windows 10 21H1+ and removed from Windows 11.
+    // Match real urbit/vere processes for this ship by pier path OR ship name.
+    // Exclude the helper PowerShell process itself to avoid self-matches.
+    let pier_name = std::path::Path::new(pier_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
     let script = format!(
-        "(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' }} | Measure-Object).Count",
-        pier_path.replace('\'', "''")  // escape single quotes for PowerShell
+        "(Get-CimInstance Win32_Process \
+          | Where-Object {{ \
+              $_.ProcessId -ne $PID -and \
+              $_.CommandLine -and \
+              $_.Name -match '^(urbit|vere)(\\.exe)?$' -and \
+              ($_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*') \
+          }} \
+          | Measure-Object).Count",
+        pier_path.replace('\'', "''"),
+        pier_name.replace('\'', "''")
     );
     std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -390,12 +425,15 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
 ///
 /// Shutdown order:
 ///   1. Confirm the ship is actually running.
-///   2. Send |exit via dojo stdin.
-///   3. Wait up to 30 s for the lock file to clear (worker exited).
-///   4. Wait a further 10 s for the launcher to also fully exit.
-///   5. Only if processes are still alive after all that: SIGTERM then SIGKILL
+///   2. Wait up to 30 s for the lock file to clear (worker exited).
+///   3. Wait a further 10 s for the launcher to also fully exit.
+///   4. Only if processes are still alive after all that: SIGTERM then SIGKILL
 ///      (Unix), or taskkill /F /T (Windows).
-fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, ShipState>) {
+fn stop_for_maintenance(
+    pier_path: &str,
+    app: &AppHandle,
+    state: &State<'_, ShipState>,
+) -> bool {
     let lock = std::path::Path::new(pier_path).join(".urb").join("lock");
 
     // ── Step 1: confirm the ship is actually running ──────────────────────────
@@ -427,20 +465,13 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
              (pier live message), then stop it cleanly and retry.",
         );
     } else {
-        // ── Step 2: send |exit ────────────────────────────────────────────────
         emit_log(
             app,
             pier_path,
-            "[portmate] Requesting clean shutdown via |exit…",
+            "[portmate] Starting shutdown for maintenance…",
         );
-        {
-            let txs = state.stdin_txs.lock().unwrap();
-            if let Some((_, tx)) = txs.iter().find(|(p, _)| p == pier_path) {
-                let _ = tx.send("|exit".to_string());
-            }
-        }
 
-        // ── Step 3: wait for worker lock to clear (up to 30 s) ───────────────
+        // ── Step 2: wait for worker lock to clear (up to 30 s) ───────────────
         let mut worker_gone = false;
         for i in 0..60 {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -449,7 +480,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                     app,
                     pier_path,
                     &format!(
-                        "[portmate] Worker exited after ~{}ms, waiting for launcher…",
+                        "[portmate] Process-based shutdown: worker exited after ~{}ms, waiting for launcher…",
                         (i + 1) * 500
                     ),
                 );
@@ -462,21 +493,21 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
             emit_log(
                 app,
                 pier_path,
-                "[portmate] Worker did not exit after 30s — escalating…",
+                "[portmate] Process-based shutdown: worker did not exit after 30s — escalating…",
             );
         }
 
-        // ── Step 4: wait for launcher + any other urbit process to also exit ──
-        // The launcher process outlives the worker briefly. Give it up to 10 s.
+        // ── Step 3: wait for launcher + any other urbit process to also exit ──
+        let wait_loops = 20;
         let mut all_gone = false;
-        for i in 0..20 {
+        for i in 0..wait_loops {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if !any_urbit_process_alive(pier_path) {
                 emit_log(
                     app,
                     pier_path,
                     &format!(
-                        "[portmate] All urbit processes exited after ~{}ms ✓",
+                        "[portmate] Process-based shutdown: all urbit processes exited after ~{}ms ✓",
                         (i + 1) * 500
                     ),
                 );
@@ -485,12 +516,15 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
             }
         }
 
-        // ── Step 5: escalate if any process is still alive ───────────────────
+        // ── Step 4: escalate if any process is still alive ───────────────────
         if !all_gone {
             emit_log(
                 app,
                 pier_path,
-                "[portmate] Processes still alive after 10s — force-killing…",
+                &format!(
+                    "[portmate] Process-based shutdown: processes still alive after {}s — force-killing…",
+                    10
+                ),
             );
 
             // Unix: SIGTERM first, then SIGKILL
@@ -527,11 +561,21 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
             // because taskkill /FI "COMMANDLINE like ..." is not reliable.
             #[cfg(windows)]
             {
+                let pier_name = std::path::Path::new(pier_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
                 let script = format!(
                     "Get-CimInstance Win32_Process \
-                     | Where-Object {{ $_.CommandLine -like '*{}*' }} \
+                     | Where-Object {{ \
+                         $_.ProcessId -ne $PID -and \
+                         $_.CommandLine -and \
+                         $_.Name -match '^(urbit|vere)(\\.exe)?$' -and \
+                         ($_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*') \
+                     }} \
                      | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}",
-                    pier_path.replace('\'', "''")
+                    pier_path.replace('\'', "''"),
+                    pier_name.replace('\'', "''")
                 );
                 let _ = std::process::Command::new("powershell")
                     .args(["-NoProfile", "-Command", &script])
@@ -577,19 +621,216 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path) {
             ship.status = "stopped".to_string();
             ship.pid = None;
+            ship.url = String::new();
+            ship.loopback_port = None;
         }
     }
     let _ = state.save();
 
-    emit_log(
-        app,
-        pier_path,
-        "[portmate] All processes clear. Proceeding with maintenance op…",
-    );
+    let fully_stopped = !any_urbit_process_alive(pier_path);
+    if fully_stopped {
+        emit_log(
+            app,
+            pier_path,
+            "[portmate] Process-based shutdown complete. Proceeding with maintenance op…",
+        );
+    } else {
+        emit_log(
+            app,
+            pier_path,
+            "[portmate] Process-based shutdown could not clear all processes; aborting maintenance.",
+        );
+    }
+
+    fully_stopped
+}
+
+fn restart_ship_after_maintenance(pier_path: String, app: &AppHandle) -> Result<(), String> {
+    // Give maintenance subprocess teardown a short window before booting again.
+    for _ in 0..20 {
+        if !any_urbit_process_alive(&pier_path) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows can briefly fail loom mapping if restart is immediate.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    restart_ship_internal(pier_path, app.clone(), app.state())
 }
 
 /// Spawn `urbit <op> <pier_name> --loom 34` from the pier's parent directory,
 /// stream stdout/stderr back as `ship-log` events, and wait for the process.
+fn run_maintenance_op(
+    op: &str,
+    binary: &str,
+    pier_name: &str,
+    work_dir: &std::path::Path,
+    pier_path: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    if op == "roll" {
+        run_roll_restart_style(binary, pier_name, work_dir, pier_path, app)
+    } else {
+        run_op(op, binary, pier_name, work_dir, pier_path, app)
+    }
+}
+
+fn run_roll_restart_style(
+    binary: &str,
+    pier_name: &str,
+    work_dir: &std::path::Path,
+    pier_path: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    run_roll_preflight_cleanup(pier_path, app);
+
+    if any_urbit_process_alive(pier_path) {
+        return Err("Ship still appears to be running after roll preflight cleanup".to_string());
+    }
+
+    emit_log(
+        app,
+        pier_path,
+        "[portmate] Roll preflight: waiting 10s after shutdown before starting roll…",
+    );
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
+    // Match boot/restart launch style: Windows runs from parent with ship name,
+    // Unix runs with full pier path and loom argument.
+    let (cwd, args): (Option<&std::path::Path>, Vec<&str>) = if cfg!(target_os = "windows") {
+        (Some(work_dir), vec!["roll", pier_name])
+    } else {
+        (None, vec!["roll", pier_path, "--loom", "34"])
+    };
+
+    let cwd_display = cwd
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "inherited".to_string());
+
+    let command_display = if cfg!(target_os = "windows") {
+        let binary_name = std::path::Path::new(binary)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("urbit.exe");
+        format!(".\\{}", binary_name)
+    } else {
+        binary.to_string()
+    };
+
+    emit_log(
+        app,
+        pier_path,
+        &format!(
+            "[portmate] Running: {} {}  (cwd: {})",
+            command_display,
+            args.join(" "),
+            cwd_display
+        ),
+    );
+
+    let mut cmd = if cfg!(target_os = "windows") {
+        let binary_name = std::path::Path::new(binary)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("urbit.exe");
+        std::process::Command::new(work_dir.join(binary_name))
+    } else {
+        std::process::Command::new(binary)
+    };
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = cmd
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start `urbit roll`: {e}"))?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let _stdin = child.stdin.take();
+
+    let app_out = app.clone();
+    let pier_out = pier_path.to_string();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().flatten() {
+            emit_log(&app_out, &pier_out, &line);
+        }
+    });
+
+    let app_err = app.clone();
+    let pier_err = pier_path.to_string();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().flatten() {
+            emit_log(&app_err, &pier_err, &format!("[stderr] {line}"));
+        }
+    });
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`urbit roll` exited with {status}"))
+    }
+}
+
+fn run_roll_preflight_cleanup(pier_path: &str, app: &AppHandle) {
+    emit_log(
+        app,
+        pier_path,
+        "[portmate] Roll preflight: final cleanup of processes and lock files…",
+    );
+
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "-f", pier_path])
+            .output();
+    }
+
+    #[cfg(windows)]
+    {
+        let pier_name = std::path::Path::new(pier_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let script = format!(
+            "Get-CimInstance Win32_Process \
+             | Where-Object {{ \
+                 $_.ProcessId -ne $PID -and \
+                 $_.CommandLine -and \
+                 $_.Name -match '^(urbit|vere)(\\.exe)?$' -and \
+                 ($_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*') \
+             }} \
+             | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}",
+            pier_path.replace('\'', "''"),
+            pier_name.replace('\'', "''")
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output();
+    }
+
+    let lock_candidates = [
+        std::path::Path::new(pier_path).join(".urb").join("lock"),
+        std::path::Path::new(pier_path).join(".vere.lock"),
+    ];
+
+    for lock in lock_candidates {
+        if lock.exists() {
+            let _ = std::fs::remove_file(&lock);
+        }
+    }
+}
+
 fn run_op(
     op: &str,
     binary: &str,

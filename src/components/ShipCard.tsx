@@ -160,7 +160,7 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
 
       {/* ── Info Row ── */}
       <div style={infoRowStyle}>
-        {ship.url ? (
+        {ship.status === "running" && ship.url ? (
           <button onClick={() => openUrl(ship.url)} style={landscapeBtnStyle}>
             Open Landscape →
           </button>
@@ -197,6 +197,20 @@ export function ShipCard({ ship, logs, onStop, onRestart, onDelete }: Props) {
       {accessCodeError && (
         <div style={errorBannerStyle}>
           {accessCodeError}
+        </div>
+      )}
+
+      {(ship.status === "booting" || (ship.status === "running" && ship.url)) && (
+        <div style={landscapeStatusStyle(Boolean(ship.url))}>
+          {ship.status === "running" && ship.url ? (
+          <button onClick={() => openUrl(ship.url)} style={landscapeLinkStyle}>
+            {`Ship URL at ${ship.url}`}
+          </button>
+        ) : (
+          <span style={landscapePendingStyle}>
+            {ship.status === "booting" ? "Waiting for web interface..." : "Unavailable"}
+          </span>
+          )}
         </div>
       )}
 
@@ -325,6 +339,37 @@ const errorBannerStyle: React.CSSProperties = {
   fontSize: 12,
   lineHeight: 1.45,
   padding: "8px 10px",
+};
+
+function landscapeStatusStyle(available: boolean): React.CSSProperties {
+  return {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    margin: "10px 16px 0",
+    padding: "8px 10px",
+    borderRadius: 8,
+    border: `1px solid ${available ? "#1d4ed8" : "#334155"}`,
+    background: available ? "#0b2545" : "#111827",
+    flexWrap: "wrap",
+  };
+}
+
+const landscapeLinkStyle: React.CSSProperties = {
+  background: "transparent",
+  border: "none",
+  padding: 0,
+  color: "#dbeafe",
+  cursor: "pointer",
+  fontSize: 12,
+  fontFamily: "monospace",
+  textAlign: "left",
+};
+
+const landscapePendingStyle: React.CSSProperties = {
+  fontSize: 12,
+  color: "#94a3b8",
+  fontFamily: "monospace",
 };
 
 const sizeWrapStyle: React.CSSProperties = {
