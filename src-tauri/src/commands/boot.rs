@@ -5,10 +5,10 @@ use std::sync::mpsc;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::{ShipInfo, ShipState};
-use crate::commands::ship_stats::refresh_ship_size;
 use super::memory_sched::ensure_default_memory_schedules_for_ship;
 use super::urbit_http::{install_exit_hook, stop_ship_graceful};
+use crate::commands::ship_stats::refresh_ship_size;
+use crate::{ShipInfo, ShipState};
 
 pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopback_port: u16) {
     thread::spawn(move || {
@@ -35,7 +35,7 @@ pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopbac
                         .trim()
                         .to_string();
 
-                    if !candidate.is_empty() {
+                    if !candidate.is_empty() && !candidate.contains("syntax error") {
                         code = candidate;
                         break;
                     }
@@ -147,7 +147,11 @@ pub fn get_platform_info() -> PlatformInfo {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
     let supported = download_url(&os, &arch).is_some();
-    PlatformInfo { os, arch, supported }
+    PlatformInfo {
+        os,
+        arch,
+        supported,
+    }
 }
 
 fn download_url(os: &str, arch: &str) -> Option<&'static str> {
@@ -203,7 +207,11 @@ pub async fn download_urbit(dest_dir: String, app: AppHandle) -> Result<String, 
         };
         let _ = app.emit(
             "download-progress",
-            DownloadProgress { percent, downloaded, total },
+            DownloadProgress {
+                percent,
+                downloaded,
+                total,
+            },
         );
     }
 
@@ -305,7 +313,8 @@ pub fn boot_comet(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let mut child = cmd.args(&args)
+    let mut child = cmd
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
@@ -392,7 +401,8 @@ pub fn boot_comet(
                         if let Some(port) = loopback_port {
                             let state = app_out.state::<ShipState>();
                             let mut ships = state.ships.lock().unwrap();
-                            if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path_out)
+                            if let Some(ship) =
+                                ships.iter_mut().find(|s| s.pier_path == pier_path_out)
                             {
                                 ship.loopback_port = Some(port);
                             }
@@ -434,7 +444,7 @@ pub fn boot_comet(
                         );
                     }
 
-                    if line.contains("pier (34): live") && !code_asked {
+                    if line.contains("pier (") && line.contains("): live") && !code_asked {
                         code_asked = true;
                         let port = loopback_port.unwrap_or_else(|| {
                             let _ = app_out.emit(
@@ -539,36 +549,32 @@ pub fn stop_ship(
         .cloned();
 
     if let Some(ship) = ship_snapshot {
-        if let (Some(port), code) = (ship.loopback_port, ship.access_code.clone()) {
-            if !code.trim().is_empty() {
-                match stop_ship_graceful(&ship.pier_path, port, &code, &ship.name) {
-                    Ok(()) => {
-                        let _ = app.emit(
-                            "ship-log",
-                            serde_json::json!({
-                                "line": "[portmate] Sent graceful shutdown via exit-hook",
-                                "pier_path": &pier_path,
-                            }),
-                        );
-                    }
-                    Err(e) => {
-                        let _ = app.emit(
-                            "ship-log",
-                            serde_json::json!({
-                                "line": format!("[portmate] Graceful shutdown failed: {e}; falling back to kill"),
-                                "pier_path": &pier_path,
-                            }),
-                        );
-                    }
-                }
-
-                for _ in 0..20 {
-                    if !state.verify_ship_status(&pier_path) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
+        match stop_ship_graceful(&ship.binary_path, &ship.pier_path) {
+            Ok(()) => {
+                let _ = app.emit(
+                    "ship-log",
+                    serde_json::json!({
+                        "line": "[portmate] Sent graceful shutdown via exit-hook thread",
+                        "pier_path": &pier_path,
+                    }),
+                );
             }
+            Err(e) => {
+                let _ = app.emit(
+                    "ship-log",
+                    serde_json::json!({
+                        "line": format!("[portmate] Graceful shutdown failed: {e}; falling back to kill"),
+                        "pier_path": &pier_path,
+                    }),
+                );
+            }
+        }
+
+        for _ in 0..20 {
+            if !state.verify_ship_status(&pier_path) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 
@@ -586,7 +592,11 @@ pub fn stop_ship(
     }
     drop(processes);
 
-    state.stdin_txs.lock().unwrap().retain(|(p, _)| p != &pier_path);
+    state
+        .stdin_txs
+        .lock()
+        .unwrap()
+        .retain(|(p, _)| p != &pier_path);
 
     let mut ships = state.ships.lock().unwrap();
     if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path) {
@@ -601,7 +611,6 @@ pub fn stop_ship(
 
     Ok(())
 }
-
 #[tauri::command]
 pub fn restart_ship(
     pier_path: String,
@@ -718,8 +727,7 @@ pub fn delete_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(),
     let _ = state.save();
 
     if Path::new(&pier_path).exists() {
-        std::fs::remove_dir_all(&pier_path)
-            .map_err(|e| format!("Failed to delete pier: {}", e))?;
+        std::fs::remove_dir_all(&pier_path).map_err(|e| format!("Failed to delete pier: {}", e))?;
     }
 
     Ok(())

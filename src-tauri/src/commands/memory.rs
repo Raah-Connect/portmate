@@ -15,7 +15,7 @@ pub fn pack_ship(
     app: AppHandle,
     state: State<'_, ShipState>,
 ) -> Result<(), String> {
-	run_memory_op("pack".to_string(), pier_path, app, state, true)
+    run_memory_op("pack".to_string(), pier_path, app, state, true)
 }
 
 #[tauri::command]
@@ -24,7 +24,7 @@ pub fn meld_ship(
     app: AppHandle,
     state: State<'_, ShipState>,
 ) -> Result<(), String> {
-	run_memory_op("meld".to_string(), pier_path, app, state, true)
+    run_memory_op("meld".to_string(), pier_path, app, state, true)
 }
 
 #[tauri::command]
@@ -33,7 +33,7 @@ pub fn roll_ship(
     app: AppHandle,
     state: State<'_, ShipState>,
 ) -> Result<(), String> {
-	run_memory_op("roll".to_string(), pier_path, app, state, true)
+    run_memory_op("roll".to_string(), pier_path, app, state, true)
 }
 
 #[tauri::command]
@@ -94,9 +94,7 @@ fn run_memory_op(
     mark_schedule_running(&app, &pier_path, &op);
 
     let run_online = use_online_pack_meld_path(&op, &pier_path, &state);
-    if !run_online
-        && !stop_for_maintenance(&pier_path, &app, &state)
-    {
+    if !run_online && !stop_for_maintenance(&pier_path, &app, &state) {
         finish_active_memory_op(&state, &pier_path);
         return Err(format!(
             "Could not fully stop ship before {op}; aborting maintenance to avoid locked pier"
@@ -121,7 +119,11 @@ fn run_memory_op(
                     success = true;
                 }
                 Err(e) => {
-                    emit_log(&app2, &path2, &format!("[portmate] online {op} failed: {e}"));
+                    emit_log(
+                        &app2,
+                        &path2,
+                        &format!("[portmate] online {op} failed: {e}"),
+                    );
                     emit_log(
                         &app2,
                         &path2,
@@ -151,15 +153,31 @@ fn run_memory_op(
 
                     match run_maintenance_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
                         Ok(()) => {
-                            emit_log(&app2, &path2, &format!("[portmate] offline {op} complete ✓"));
+                            emit_log(
+                                &app2,
+                                &path2,
+                                &format!("[portmate] offline {op} complete ✓"),
+                            );
                             success = true;
 
                             if restart_after {
-                                emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
-                                if let Err(error) = restart_ship_after_maintenance(path2.clone(), &app2) {
-                                    emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
+                                emit_log(
+                                    &app2,
+                                    &path2,
+                                    "[portmate] Restarting ship after maintenance…",
+                                );
+                                if let Err(error) =
+                                    restart_ship_after_maintenance(path2.clone(), &app2)
+                                {
+                                    emit_log(
+                                        &app2,
+                                        &path2,
+                                        &format!("[portmate] restart failed: {error}"),
+                                    );
                                     success = false;
-                                    error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
+                                    error_message = Some(format!(
+                                        "Maintenance succeeded but restart failed: {error}"
+                                    ));
                                 }
                             }
                         }
@@ -167,7 +185,9 @@ fn run_memory_op(
                             emit_log(
                                 &app2,
                                 &path2,
-                                &format!("[portmate] offline fallback {op} failed: {fallback_error}"),
+                                &format!(
+                                    "[portmate] offline fallback {op} failed: {fallback_error}"
+                                ),
                             );
                             error_message = Some(format!(
                                 "Online {op} failed: {e}; offline fallback failed: {fallback_error}"
@@ -180,7 +200,9 @@ fn run_memory_op(
             emit_log(
                 &app2,
                 &path2,
-                &format!("[portmate] Starting {op} on '{pier_name}' — this may take a few minutes…"),
+                &format!(
+                    "[portmate] Starting {op} on '{pier_name}' — this may take a few minutes…"
+                ),
             );
             match run_maintenance_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
                 Ok(()) => {
@@ -188,11 +210,20 @@ fn run_memory_op(
                     success = true;
 
                     if restart_after {
-                        emit_log(&app2, &path2, "[portmate] Restarting ship after maintenance…");
+                        emit_log(
+                            &app2,
+                            &path2,
+                            "[portmate] Restarting ship after maintenance…",
+                        );
                         if let Err(error) = restart_ship_after_maintenance(path2.clone(), &app2) {
-                            emit_log(&app2, &path2, &format!("[portmate] restart failed: {error}"));
+                            emit_log(
+                                &app2,
+                                &path2,
+                                &format!("[portmate] restart failed: {error}"),
+                            );
                             success = false;
-                            error_message = Some(format!("Maintenance succeeded but restart failed: {error}"));
+                            error_message =
+                                Some(format!("Maintenance succeeded but restart failed: {error}"));
                         }
                     }
                 }
@@ -241,11 +272,7 @@ fn begin_active_memory_op(state: &State<'_, ShipState>, pier_path: &str) -> Resu
 }
 
 fn finish_active_memory_op(state: &State<'_, ShipState>, pier_path: &str) {
-    state
-        .active_memory_ops
-        .lock()
-        .unwrap()
-        .remove(pier_path);
+    state.active_memory_ops.lock().unwrap().remove(pier_path);
 }
 
 fn binary_for(pier_path: &str, state: &State<'_, ShipState>) -> Result<String, String> {
@@ -306,7 +333,9 @@ fn run_online_pack_meld(
     pier_path: &str,
     app: &AppHandle,
 ) -> Result<(), String> {
-    let conn_sock = std::path::Path::new(pier_path).join(".urb").join("conn.sock");
+    let conn_sock = std::path::Path::new(pier_path)
+        .join(".urb")
+        .join("conn.sock");
     if !conn_sock.exists() {
         return Err(format!(
             "No conn.sock found at {}. Is the ship running?",
@@ -429,11 +458,7 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
 ///   3. Wait a further 10 s for the launcher to also fully exit.
 ///   4. Only if processes are still alive after all that: SIGTERM then SIGKILL
 ///      (Unix), or taskkill /F /T (Windows).
-fn stop_for_maintenance(
-    pier_path: &str,
-    app: &AppHandle,
-    state: &State<'_, ShipState>,
-) -> bool {
+fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, ShipState>) -> bool {
     let lock = std::path::Path::new(pier_path).join(".urb").join("lock");
 
     // ── Step 1: confirm the ship is actually running ──────────────────────────
@@ -470,6 +495,15 @@ fn stop_for_maintenance(
             pier_path,
             "[portmate] Starting shutdown for maintenance…",
         );
+
+        // ── Step 1.5: send graceful exit via exit-hook thread ─────────────────
+        let binary = binary_for(pier_path, state).unwrap_or_default();
+        if !binary.is_empty() {
+            match super::urbit_http::stop_ship_graceful(&binary, pier_path) {
+                Ok(()) => emit_log(app, pier_path, "[portmate] Graceful shutdown signal sent via exit-hook thread"),
+                Err(e) => emit_log(app, pier_path, &format!("[portmate] Graceful shutdown signal failed: {e}; will wait for process to exit or force-kill")),
+            }
+        }
 
         // ── Step 2: wait for worker lock to clear (up to 30 s) ───────────────
         let mut worker_gone = false;

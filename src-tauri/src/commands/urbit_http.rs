@@ -1,19 +1,14 @@
 use reqwest::blocking::Client;
+use std::io::Write;
+use std::process::Stdio;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 /// Copy exit-hook.hoon into the pier and activate it via lens.
 /// Safe to call on every boot — skips if already installed.
-pub fn install_exit_hook(
-    app: &AppHandle,
-    pier_path: &str,
-    loopback_port: u16,
-) {
-    // Destination
-    let dest = std::path::Path::new(pier_path)
-        .join("base/app/exit-hook.hoon");
+pub fn install_exit_hook(app: &AppHandle, pier_path: &str, loopback_port: u16) {
+    let dest = std::path::Path::new(pier_path).join("base/ted/exit-hook.hoon");
 
-    // Copy from bundled resources if not already there
     if !dest.exists() {
         if let Some(parent) = dest.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -22,10 +17,10 @@ pub fn install_exit_hook(
             }
         }
 
-        let resource_path = match app
-            .path()
-            .resolve("resources/hoon/exit-hook.hoon", tauri::path::BaseDirectory::Resource)
-        {
+        let resource_path = match app.path().resolve(
+            "resources/hoon/exit-hook.hoon",
+            tauri::path::BaseDirectory::Resource,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[exit-hook] could not resolve resource: {e}");
@@ -40,91 +35,70 @@ pub fn install_exit_hook(
         eprintln!("[exit-hook] installed to {}", dest.display());
     }
 
-    // Send |commit %base and |rein %base [& %exit-hook] via lens
+    // Only |commit %base — no |rein needed for threads
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 
     let base = format!("http://localhost:{}", loopback_port);
+    let body = serde_json::json!({
+        "source": { "dojo": "|commit %base" },
+        "sink":   { "stdout": null }
+    });
 
-    for cmd in &[
-        "|commit %base",
-        "|rein %base [& %exit-hook]",
-    ] {
-        let body = serde_json::json!({
-            "source": { "dojo": cmd },
-            "sink":   { "stdout": null }
-        });
-
-        match client.post(&base)
-            .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-        {
-            Ok(_)  => eprintln!("[exit-hook] sent: {cmd}"),
-            Err(e) => eprintln!("[exit-hook] lens error for `{cmd}`: {e}"),
-        }
-
-        std::thread::sleep(Duration::from_secs(2));
+    match client
+        .post(&base)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+    {
+        Ok(_) => eprintln!("[exit-hook] committed base"),
+        Err(e) => eprintln!("[exit-hook] lens error: {e}"),
     }
 }
 
-/// Gracefully stop a ship via the exit-hook agent over HTTP.
-/// Falls back to kill if HTTP fails.
-pub fn stop_ship_graceful(
-    _pier_path: &str,
-    port: u16,
-    access_code: &str,
-    ship_name: &str,  // full comet name e.g. "livdec-rovmep-..."
-) -> Result<(), String> {
-    let base = format!("http://localhost:{}", port);
-    let channel = format!("{}/~/channel/portmate-exit", base);
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+/// Gracefully stop a ship via the exit-hook thread over conn.sock.
+pub fn stop_ship_graceful(binary_path: &str, pier_path: &str) -> Result<(), String> {
+    let conn_sock = format!("{}/.urb/conn.sock", pier_path);
 
-    // Login
-    let login = client
-        .post(format!("{}/~/login", base))
-        .form(&[("password", access_code)])
-        .send()
-        .map_err(|e| format!("login failed: {e}"))?;
+    // Step 1: jam the noun
+    let mut jam_proc = std::process::Command::new(binary_path)
+        .args(["eval", "-jn"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("jam spawn failed: {e}"))?;
 
-    if !login.status().is_success() {
-        return Err(format!("login failed with HTTP {}", login.status()));
-    }
+    jam_proc
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"[0 %fyrd %base %exit-hook [%noun %noun ~]]")
+        .map_err(|e| format!("jam write failed: {e}"))?;
 
-    // Extract cookie
-    let cookie = login
-        .headers()
-        .get("set-cookie")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(';').next().unwrap_or("").to_string())
-        .ok_or("no cookie in login response")?;
+    let jammed = jam_proc
+        .wait_with_output()
+        .map_err(|e| format!("jam failed: {e}"))?
+        .stdout;
 
-    // Poke exit-hook
-    let body = serde_json::json!([{
-        "id": 1,
-        "action": "poke",
-        "ship": ship_name,
-        "app": "exit-hook",
-        "mark": "json",
-        "json": null
-    }]);
+    // Step 2: send to conn.sock
+    let mut nc = std::process::Command::new("nc")
+        .args(["-U", "-w", "1", &conn_sock])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("nc spawn failed: {e}"))?;
 
-    let poke = client
-        .post(&channel)
-        .header("Content-Type", "application/json")
-        .header("Cookie", &cookie)
-        .body(body.to_string())
-        .send()
-        .map_err(|e| format!("poke failed: {e}"))?;
+    nc.stdin
+        .take()
+        .unwrap()
+        .write_all(&jammed)
+        .map_err(|e| format!("nc write failed: {e}"))?;
 
-    if !poke.status().is_success() {
-        return Err(format!("poke failed with HTTP {}", poke.status()));
-    }
+    nc.wait().map_err(|e| format!("nc wait failed: {e}"))?;
 
     Ok(())
 }

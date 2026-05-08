@@ -5,9 +5,10 @@ use std::sync::mpsc;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::ShipState;
-use crate::ShipInfo;
 use super::boot::spawn_access_code_fetch;
+use super::urbit_http::install_exit_hook;
+use crate::ShipInfo;
+use crate::ShipState;
 
 // ── Boot Existing ─────────────────────────────────────────────────────────────
 //
@@ -22,8 +23,8 @@ use super::boot::spawn_access_code_fetch;
 fn download_url(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("https://urbit.org/install/macos-aarch64/latest"),
-        ("macos", "x86_64")  => Some("https://urbit.org/install/macos-x86_64/latest"),
-        ("linux", "x86_64")  => Some("https://urbit.org/install/linux-x86_64/latest"),
+        ("macos", "x86_64") => Some("https://urbit.org/install/macos-x86_64/latest"),
+        ("linux", "x86_64") => Some("https://urbit.org/install/linux-x86_64/latest"),
         ("linux", "aarch64") => Some("https://urbit.org/install/linux-aarch64/latest"),
         // Note: no trailing space
         ("windows", "x86_64") => {
@@ -119,11 +120,7 @@ async fn find_or_download_binary(pier_path: &str, app: &AppHandle) -> Result<Str
         ));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?
-        .to_vec();
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?.to_vec();
 
     let result = extract_urbit(&bytes, &parent)?;
 
@@ -193,7 +190,8 @@ pub async fn boot_existing(
     if let Some(dir) = cwd_dir {
         cmd.current_dir(&dir);
     }
-    let mut child = cmd.args(&args)
+    let mut child = cmd
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
@@ -269,7 +267,8 @@ pub async fn boot_existing(
                         if let Some(port) = loopback_port {
                             let state = app_out.state::<ShipState>();
                             let mut ships = state.ships.lock().unwrap();
-                            if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path_out)
+                            if let Some(ship) =
+                                ships.iter_mut().find(|s| s.pier_path == pier_path_out)
                             {
                                 ship.loopback_port = Some(port);
                             }
@@ -322,6 +321,13 @@ pub async fn boot_existing(
                                 }),
                             );
                             12321
+                        });
+
+                        // ← add these lines
+                        let app_http = app_out.clone();
+                        let pier_http = pier_path_out.clone();
+                        thread::spawn(move || {
+                            install_exit_hook(&app_http, &pier_http, port);
                         });
 
                         spawn_access_code_fetch(app_out.clone(), pier_path_out.clone(), port);

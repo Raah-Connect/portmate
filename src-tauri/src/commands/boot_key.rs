@@ -5,9 +5,9 @@ use std::sync::mpsc;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{ShipInfo, ShipState};
 use super::boot::spawn_access_code_fetch;
 use super::memory_sched::ensure_default_memory_schedules_for_ship;
+use crate::{ShipInfo, ShipState};
 
 // ── Boot from Key File ────────────────────────────────────────────────────────
 //
@@ -27,8 +27,8 @@ use super::memory_sched::ensure_default_memory_schedules_for_ship;
 fn download_url(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("https://urbit.org/install/macos-aarch64/latest"),
-        ("macos", "x86_64")  => Some("https://urbit.org/install/macos-x86_64/latest"),
-        ("linux", "x86_64")  => Some("https://urbit.org/install/linux-x86_64/latest"),
+        ("macos", "x86_64") => Some("https://urbit.org/install/macos-x86_64/latest"),
+        ("linux", "x86_64") => Some("https://urbit.org/install/linux-x86_64/latest"),
         ("linux", "aarch64") => Some("https://urbit.org/install/linux-aarch64/latest"),
         // Note: no trailing space
         ("windows", "x86_64") => {
@@ -119,11 +119,7 @@ async fn find_or_download_binary(pier_dir: &str, app: &AppHandle) -> Result<Stri
         ));
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?
-        .to_vec();
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?.to_vec();
 
     let result = extract_urbit(&bytes, dir)?;
 
@@ -205,7 +201,15 @@ pub async fn boot_key(
     let binary_path = find_or_download_binary(&pier_dir, &app).await?;
 
     let args: Vec<&str> = if cfg!(target_os = "windows") {
-        vec!["-w", &ship_name, "-G", &key_contents, "-c", &pier_path, "-t"]
+        vec![
+            "-w",
+            &ship_name,
+            "-G",
+            &key_contents,
+            "-c",
+            &pier_path,
+            "-t",
+        ]
     } else {
         vec![
             "-w",
@@ -296,7 +300,8 @@ pub async fn boot_key(
                         if let Some(port) = loopback_port {
                             let state = app_out.state::<ShipState>();
                             let mut ships = state.ships.lock().unwrap();
-                            if let Some(ship) = ships.iter_mut().find(|s| s.pier_path == pier_path_out)
+                            if let Some(ship) =
+                                ships.iter_mut().find(|s| s.pier_path == pier_path_out)
                             {
                                 ship.loopback_port = Some(port);
                             }
