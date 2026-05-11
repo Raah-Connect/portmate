@@ -14,19 +14,98 @@ pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopbac
     thread::spawn(move || {
         let client = reqwest::blocking::Client::new();
         let mut code = String::new();
+        let lens_command = r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#;
+        let lens_cancel_command = r#"{"source":{"cancel":null},"sink":{"stdout":null}}"#;
+        let lens_url = format!("http://localhost:{}", loopback_port);
+        let powershell_cmd = format!(
+            "Invoke-WebRequest -UseBasicParsing -Method POST -Uri \"{}\" -ContentType \"application/json\" -Body '{}'",
+            lens_url, lens_command
+        );
+
+        let _ = app.emit(
+            "ship-log",
+            serde_json::json!({
+                "line": format!(
+                    "[lens] sending command to http://localhost:{} :: {}",
+                    loopback_port, lens_command
+                ),
+                "pier_path": &pier_path,
+            }),
+        );
+
+        let _ = app.emit(
+            "ship-log",
+            serde_json::json!({
+                "line": format!(
+                    "[lens] exact request => method=POST url={} headers={{\"Content-Type\":\"application/json\"}} body={}",
+                    lens_url,
+                    lens_command
+                ),
+                "pier_path": &pier_path,
+            }),
+        );
+
+        let _ = app.emit(
+            "ship-log",
+            serde_json::json!({
+                "line": format!("[lens] powershell test => {}", powershell_cmd),
+                "pier_path": &pier_path,
+            }),
+        );
+
+        let _ = app.emit(
+            "ship-log",
+            serde_json::json!({
+                "line": format!(
+                    "[lens] preflight reset => method=POST url={} body={}",
+                    lens_url,
+                    lens_cancel_command
+                ),
+                "pier_path": &pier_path,
+            }),
+        );
+
+        match client
+            .post(&lens_url)
+            .header("Content-Type", "application/json")
+            .body(lens_cancel_command)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let _ = app.emit(
+                    "ship-log",
+                    serde_json::json!({
+                        "line": format!("[lens] preflight reset result => HTTP {}", status),
+                        "pier_path": &pier_path,
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    "ship-log",
+                    serde_json::json!({
+                        "line": format!("[lens] preflight reset failed => {}", error),
+                        "pier_path": &pier_path,
+                    }),
+                );
+            }
+        }
 
         for attempt in 1..=40 {
             std::thread::sleep(std::time::Duration::from_secs(3));
 
             let response = client
-                .post(format!("http://localhost:{}", loopback_port))
+                .post(&lens_url)
                 .header("Content-Type", "application/json")
-                .body(r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#)
+                .body(lens_command)
                 .timeout(std::time::Duration::from_secs(5))
                 .send();
 
             match response {
                 Ok(resp) => {
+                    let status = resp.status();
                     let text = resp.text().unwrap_or_default();
                     let candidate = text
                         .trim()
@@ -34,25 +113,71 @@ pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopbac
                         .replace("\\n", "")
                         .trim()
                         .to_string();
+                    let text_preview = text
+                        .replace('\n', " ")
+                        .replace('\r', " ")
+                        .chars()
+                        .take(160)
+                        .collect::<String>();
 
-                    if !candidate.is_empty() && !candidate.contains("syntax error") {
+                    let looks_like_lens_html_error = text.contains("<html")
+                        || text.contains("Internal Server Error")
+                        || text.contains("/app/lens/hoon");
+
+                    if status.is_success()
+                        && !candidate.is_empty()
+                        && !candidate.contains("syntax error")
+                        && !looks_like_lens_html_error
+                    {
                         code = candidate;
                         break;
                     }
 
+                    let reason = if !status.is_success() {
+                        format!("HTTP {} from lens", status)
+                    } else if looks_like_lens_html_error {
+                        "lens returned Internal Server Error HTML".to_string()
+                    } else if candidate.contains("syntax error") {
+                        "dojo syntax error in lens response".to_string()
+                    } else {
+                        "empty response".to_string()
+                    };
+
                     let _ = app.emit(
                         "ship-log",
                         serde_json::json!({
-                            "line": format!("[lens] attempt {} — empty response, retrying…", attempt),
+                            "line": format!(
+                                "[lens] attempt {} — {}, retrying… preview: {}",
+                                attempt,
+                                reason,
+                                text_preview
+                            ),
                             "pier_path": &pier_path,
                         }),
                     );
+
+                    if !status.is_success() {
+                        let _ = app.emit(
+                            "ship-log",
+                            serde_json::json!({
+                                "line": "[lens] retry reset => sending cancel to clear possible stale job",
+                                "pier_path": &pier_path,
+                            }),
+                        );
+
+                        let _ = client
+                            .post(&lens_url)
+                            .header("Content-Type", "application/json")
+                            .body(lens_cancel_command)
+                            .timeout(std::time::Duration::from_secs(5))
+                            .send();
+                    }
                 }
                 Err(error) => {
                     let _ = app.emit(
                         "ship-log",
                         serde_json::json!({
-                            "line": format!("[lens] attempt {} — {}, retrying…", attempt, error),
+                            "line": format!("[lens] attempt {} — request failed: {}, retrying…", attempt, error),
                             "pier_path": &pier_path,
                         }),
                     );
@@ -68,6 +193,13 @@ pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopbac
             }
             drop(ships);
             let _ = state.save();
+            let _ = app.emit(
+                "ship-log",
+                serde_json::json!({
+                    "line": "[lens] access code fetched successfully (masked)",
+                    "pier_path": &pier_path,
+                }),
+            );
             let _ = app.emit(
                 "ship-code",
                 serde_json::json!({
