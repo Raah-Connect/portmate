@@ -5,6 +5,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::boot::restart_ship_internal;
 use super::memory_sched::{mark_schedule_running, record_schedule_result};
+use super::click_stop::stop_ship_graceful;
 use crate::ShipState;
 
 // ── Memory operations entry points ────────────────────────────────────────────
@@ -496,13 +497,15 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
             "[portmate] Starting shutdown for maintenance…",
         );
 
-        // ── Step 1.5: send graceful exit via exit-hook thread ─────────────────
-        let binary = binary_for(pier_path, state).unwrap_or_default();
-        if !binary.is_empty() {
-            match super::urbit_http::stop_ship_graceful(&binary, pier_path) {
-                Ok(()) => emit_log(app, pier_path, "[portmate] Graceful shutdown signal sent via exit-hook thread"),
-                Err(e) => emit_log(app, pier_path, &format!("[portmate] Graceful shutdown signal failed: {e}; will wait for process to exit or force-kill")),
-            }
+        // ── Step 1.5: send graceful exit via click ─────────────────────────────
+        if let Err(e) = stop_ship_graceful(pier_path) {
+            emit_log(app, pier_path, &format!("[portmate] Graceful shutdown signal failed: {e}; will wait for process to exit or force-kill"));
+        } else {
+            emit_log(
+                app,
+                pier_path,
+                "[portmate] Graceful shutdown signal sent via click",
+            );
         }
 
         // ── Step 2: wait for worker lock to clear (up to 30 s) ───────────────
@@ -927,17 +930,4 @@ fn emit_log(app: &AppHandle, pier_path: &str, line: &str) {
     );
 }
 
-#[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(windows)]
-fn is_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .output()
-        .map_or(false, |o| {
-            String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
-        })
-}
+use super::process_utils::is_pid_alive;

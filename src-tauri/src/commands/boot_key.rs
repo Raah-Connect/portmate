@@ -152,6 +152,14 @@ pub async fn boot_key(
         return Err(format!("Pier directory not found at {}", pier_dir));
     }
 
+    // Copy click and click-format into the pier directory
+    let click_src = Path::new("src-tauri/resources/click");
+    let click_dst = Path::new(&pier_dir).join("click");
+    let _ = std::fs::copy(&click_src, &click_dst);
+    let click_format_src = Path::new("src-tauri/resources/click-format");
+    let click_format_dst = Path::new(&pier_dir).join("click-format");
+    let _ = std::fs::copy(&click_format_src, &click_format_dst);
+
     // Read and trim the key file contents — handles trailing newlines or
     // whitespace regardless of how the file was saved
     let key_contents = std::fs::read_to_string(&key_file_path)

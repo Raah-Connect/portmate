@@ -6,7 +6,6 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::boot::spawn_access_code_fetch;
-use super::urbit_http::install_exit_hook;
 use crate::ShipInfo;
 use crate::ShipState;
 
@@ -147,6 +146,14 @@ pub async fn boot_existing(
     if !std::path::Path::new(&pier_path).exists() {
         return Err(format!("Pier not found at {}", pier_path));
     }
+
+    // Copy click and click-format into the pier directory
+    let click_src = Path::new("src-tauri/resources/click");
+    let click_dst = Path::new(&pier_path).join("click");
+    let _ = std::fs::copy(&click_src, &click_dst);
+    let click_format_src = Path::new("src-tauri/resources/click-format");
+    let click_format_dst = Path::new(&pier_path).join("click-format");
+    let _ = std::fs::copy(&click_format_src, &click_format_dst);
 
     // Auto-detect or download the binary
     let binary_path = find_or_download_binary(&pier_path, &app).await?;
@@ -321,13 +328,6 @@ pub async fn boot_existing(
                                 }),
                             );
                             12321
-                        });
-
-                        // ← add these lines
-                        let app_http = app_out.clone();
-                        let pier_http = pier_path_out.clone();
-                        thread::spawn(move || {
-                            install_exit_hook(&app_http, &pier_http, port);
                         });
 
                         spawn_access_code_fetch(app_out.clone(), pier_path_out.clone(), port);

@@ -6,12 +6,34 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::memory_sched::ensure_default_memory_schedules_for_ship;
-use super::urbit_http::{install_exit_hook, stop_ship_graceful};
+use super::click_stop::stop_ship_graceful;
 use crate::commands::ship_stats::refresh_ship_size;
 use crate::{ShipInfo, ShipState};
 
 pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopback_port: u16) {
     thread::spawn(move || {
+        // Check if access code is already present
+        let state = app.state::<ShipState>();
+        let ships = state.ships.lock().unwrap();
+        if let Some(ship) = ships.iter().find(|s| s.pier_path == pier_path && !s.access_code.trim().is_empty()) {
+            let _ = app.emit(
+                "ship-log",
+                serde_json::json!({
+                    "line": "[lens] access code already present, skipping fetch",
+                    "pier_path": &pier_path,
+                }),
+            );
+            let _ = app.emit(
+                "ship-code",
+                serde_json::json!({
+                    "pier_path": &pier_path,
+                    "code": ship.access_code.clone(),
+                }),
+            );
+            return;
+        }
+        drop(ships);
+
         let client = reqwest::blocking::Client::new();
         let mut code = String::new();
         let lens_command = r#"{"source":{"dojo":"+code"},"sink":{"stdout":null}}"#;
@@ -589,12 +611,6 @@ pub fn boot_comet(
                             12321
                         });
 
-                        let app_http = app_out.clone();
-                        let pier_http = pier_path_out.clone();
-                        thread::spawn(move || {
-                            install_exit_hook(&app_http, &pier_http, port);
-                        });
-
                         spawn_access_code_fetch(app_out.clone(), pier_path_out.clone(), port);
                     }
                 }
@@ -681,12 +697,12 @@ pub fn stop_ship(
         .cloned();
 
     if let Some(ship) = ship_snapshot {
-        match stop_ship_graceful(&ship.binary_path, &ship.pier_path) {
+        match stop_ship_graceful(&ship.pier_path) {
             Ok(()) => {
                 let _ = app.emit(
                     "ship-log",
                     serde_json::json!({
-                        "line": "[portmate] Sent graceful shutdown via exit-hook thread",
+                        "line": "[portmate] Sent graceful shutdown via click",
                         "pier_path": &pier_path,
                     }),
                 );
