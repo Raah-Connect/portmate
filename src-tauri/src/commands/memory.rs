@@ -4,8 +4,8 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::boot::restart_ship_internal;
-use super::memory_sched::{mark_schedule_running, record_schedule_result};
 use super::click_stop::stop_ship_graceful;
+use super::memory_sched::{mark_schedule_running, record_schedule_result};
 use crate::ShipState;
 
 // ── Memory operations entry points ────────────────────────────────────────────
@@ -498,7 +498,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         );
 
         // ── Step 1.5: send graceful exit via click ─────────────────────────────
-        if let Err(e) = stop_ship_graceful(pier_path) {
+        if let Err(e) = stop_ship_graceful(pier_path, app) {
             emit_log(app, pier_path, &format!("[portmate] Graceful shutdown signal failed: {e}; will wait for process to exit or force-kill"));
         } else {
             emit_log(

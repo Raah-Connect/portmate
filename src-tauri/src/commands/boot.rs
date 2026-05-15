@@ -5,8 +5,8 @@ use std::sync::mpsc;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::memory_sched::ensure_default_memory_schedules_for_ship;
 use super::click_stop::stop_ship_graceful;
+use super::memory_sched::ensure_default_memory_schedules_for_ship;
 use crate::commands::ship_stats::refresh_ship_size;
 use crate::{ShipInfo, ShipState};
 
@@ -15,7 +15,10 @@ pub(crate) fn spawn_access_code_fetch(app: AppHandle, pier_path: String, loopbac
         // Check if access code is already present
         let state = app.state::<ShipState>();
         let ships = state.ships.lock().unwrap();
-        if let Some(ship) = ships.iter().find(|s| s.pier_path == pier_path && !s.access_code.trim().is_empty()) {
+        if let Some(ship) = ships
+            .iter()
+            .find(|s| s.pier_path == pier_path && !s.access_code.trim().is_empty())
+        {
             let _ = app.emit(
                 "ship-log",
                 serde_json::json!({
@@ -697,7 +700,7 @@ pub fn stop_ship(
         .cloned();
 
     if let Some(ship) = ship_snapshot {
-        match stop_ship_graceful(&ship.pier_path) {
+        match stop_ship_graceful(&ship.pier_path, &app) {
             Ok(()) => {
                 let _ = app.emit(
                     "ship-log",
