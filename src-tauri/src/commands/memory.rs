@@ -401,19 +401,51 @@ fn run_online_pack_meld(
 /// Returns true if any live process has `pier_path` in its command line.
 /// This catches BOTH the urbit launcher and the worker process.
 #[cfg(unix)]
-fn any_urbit_process_alive(pier_path: &str) -> bool {
-    // `pgrep -f <pattern>` exits 0 if at least one match, 1 if none.
-    std::process::Command::new("pgrep")
-        .args(["-f", pier_path])
+fn find_urbit_process_pids(pier_path: &str) -> Vec<u32> {
+    let self_pid = std::process::id().to_string();
+    std::process::Command::new("ps")
+        .args(["-eo", "pid,comm,args"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .map(|o| {
+            if !o.status.success() {
+                return Vec::new();
+            }
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout
+                .lines()
+                .filter_map(|line| {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    let mut parts = trimmed.split_whitespace();
+                    let pid = parts.next()?;
+                    let comm = parts.next()?;
+                    let args = parts.collect::<Vec<_>>().join(" ");
+                    if pid == self_pid {
+                        return None;
+                    }
+                    if !(comm == "urbit" || comm == "vere") {
+                        return None;
+                    }
+                    if args.contains(pier_path) {
+                        pid.parse::<u32>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn any_urbit_process_alive(pier_path: &str) -> bool {
+    !find_urbit_process_pids(pier_path).is_empty()
 }
 
 #[cfg(windows)]
-fn any_urbit_process_alive(pier_path: &str) -> bool {
-    // Match real urbit/vere processes for this ship by pier path OR ship name.
-    // Exclude the helper PowerShell process itself to avoid self-matches.
+fn find_urbit_process_pids(pier_path: &str) -> Vec<u32> {
     let pier_name = std::path::Path::new(pier_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -426,7 +458,7 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
               $_.Name -match '^(urbit|vere)(\\.exe)?$' -and \
               ($_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*') \
           }} \
-          | Measure-Object).Count",
+          | ForEach-Object {{ $_.ProcessId }}) -join ' '",
         pier_path.replace('\'', "''"),
         pier_name.replace('\'', "''")
     );
@@ -434,13 +466,20 @@ fn any_urbit_process_alive(pier_path: &str) -> bool {
         .args(["-NoProfile", "-Command", &script])
         .output()
         .map(|o| {
+            if !o.status.success() {
+                return Vec::new();
+            }
             String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0)
-                > 0
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+                .collect()
         })
-        .unwrap_or(false)
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn any_urbit_process_alive(pier_path: &str) -> bool {
+    !find_urbit_process_pids(pier_path).is_empty()
 }
 
 /// Gracefully shut down the ship before a maintenance op.
@@ -564,6 +603,22 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 ),
             );
 
+            let alive_pids = find_urbit_process_pids(pier_path);
+            if !alive_pids.is_empty() {
+                emit_log(
+                    app,
+                    pier_path,
+                    &format!(
+                        "[portmate] Debug: live urbit process ids before escalation: {}",
+                        alive_pids
+                            .iter()
+                            .map(|pid| pid.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                );
+            }
+
             // Unix: SIGTERM first, then SIGKILL
             #[cfg(unix)]
             {
@@ -618,6 +673,22 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                     .args(["-NoProfile", "-Command", &script])
                     .output();
                 std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+
+            let remaining_pids = find_urbit_process_pids(pier_path);
+            if !remaining_pids.is_empty() {
+                emit_log(
+                    app,
+                    pier_path,
+                    &format!(
+                        "[portmate] Debug: remaining urbit process ids after kill attempts: {}",
+                        remaining_pids
+                            .iter()
+                            .map(|pid| pid.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                );
             }
 
             if any_urbit_process_alive(pier_path) {
