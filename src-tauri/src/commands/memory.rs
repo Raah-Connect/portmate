@@ -205,7 +205,14 @@ fn run_memory_op(
                     "[portmate] Starting {op} on '{pier_name}' — this may take a few minutes…"
                 ),
             );
-            match run_maintenance_op(&op, &binary, &pier_name, &work_dir, &path2, &app2) {
+            match run_maintenance_op_with_retries(
+                &op,
+                &binary,
+                &pier_name,
+                &work_dir,
+                &path2,
+                &app2,
+            ) {
                 Ok(()) => {
                     emit_log(&app2, &path2, &format!("[portmate] {op} complete ✓"));
                     success = true;
@@ -769,6 +776,124 @@ fn restart_ship_after_maintenance(pier_path: String, app: &AppHandle) -> Result<
     }
 
     restart_ship_internal(pier_path, app.clone(), app.state())
+}
+
+/// Wrapper around run_maintenance_op that adds retry logic for roll and chop.
+/// If a roll or chop fails and the ship is still stopped after 60 seconds,
+/// retry once. If the second attempt also fails, restart the ship.
+fn run_maintenance_op_with_retries(
+    op: &str,
+    binary: &str,
+    pier_name: &str,
+    work_dir: &std::path::Path,
+    pier_path: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    // Only retry logic for roll and chop; pack and meld run normally
+    if !matches!(op, "roll" | "chop") {
+        return run_maintenance_op(op, binary, pier_name, work_dir, pier_path, app);
+    }
+
+    // First attempt for roll/chop
+    emit_log(
+        app,
+        pier_path,
+        &format!("[portmate] {op} attempt 1 of 2…"),
+    );
+
+    let result = run_maintenance_op(op, binary, pier_name, work_dir, pier_path, app);
+
+    if result.is_ok() {
+        return Ok(());
+    }
+
+    let first_error = result.err().unwrap();
+    emit_log(
+        app,
+        pier_path,
+        &format!("[portmate] {op} attempt 1 failed: {first_error}"),
+    );
+
+    // Wait 60 seconds and check if the ship is still stopped
+    emit_log(
+        app,
+        pier_path,
+        "[portmate] Waiting 60 seconds before retry…",
+    );
+
+    for i in 0..120 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if i % 20 == 0 && i > 0 {
+            let secs_remaining = (120 - i) / 2;
+            if secs_remaining > 0 {
+                emit_log(
+                    app,
+                    pier_path,
+                    &format!("[portmate] Retry waiting… {} seconds remaining", secs_remaining),
+                );
+            }
+        }
+    }
+
+    // Check if ship is still stopped
+    let still_stopped = !any_urbit_process_alive(pier_path);
+    if !still_stopped {
+        emit_log(
+            app,
+            pier_path,
+            "[portmate] Warning: ship started running while waiting for retry. Skipping retry.",
+        );
+        return Err(format!("{op} failed and ship is now running unexpectedly"));
+    }
+
+    // Second attempt
+    emit_log(
+        app,
+        pier_path,
+        &format!("[portmate] {op} attempt 2 of 2 after 60-second wait…"),
+    );
+
+    let retry_result = run_maintenance_op(op, binary, pier_name, work_dir, pier_path, app);
+
+    match retry_result {
+        Ok(()) => Ok(()),
+        Err(second_error) => {
+            emit_log(
+                app,
+                pier_path,
+                &format!("[portmate] {op} attempt 2 also failed: {second_error}"),
+            );
+            emit_log(
+                app,
+                pier_path,
+                &format!("[portmate] Both {op} attempts failed. Initiating emergency restart…"),
+            );
+
+            // Force restart after failed retries
+            let state = app.state::<ShipState>();
+            if let Err(restart_err) = restart_ship_internal(pier_path.to_string(), app.clone(), state) {
+                emit_log(
+                    app,
+                    pier_path,
+                    &format!("[portmate] Emergency restart failed: {restart_err}"),
+                );
+                return Err(format!(
+                    "{op} failed twice and emergency restart encountered error: {restart_err}"
+                ));
+            }
+
+            emit_log(
+                app,
+                pier_path,
+                &format!("[portmate] Emergency restart initiated after failed {op} attempts"),
+            );
+
+            // Return an error indicating the op failed, but the ship was restarted
+            Err(format!(
+                "{op} failed twice. Ship has been restarted. First error: {first_error}; Second error: {second_error}"
+            ))
+        }
+    }
 }
 
 /// Spawn `urbit <op> <pier_name> --loom 34` from the pier's parent directory,
