@@ -544,8 +544,9 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         );
 
         // ── Step 1.5: send graceful exit via click ─────────────────────────────
-        if let Err(e) = stop_ship_graceful(pier_path, app) {
-            emit_log(app, pier_path, &format!("[portmate] Graceful shutdown signal failed: {e}; will wait for process to exit or force-kill"));
+        let graceful_ok = stop_ship_graceful(pier_path, app).is_ok();
+        if !graceful_ok {
+            emit_log(app, pier_path, "[portmate] Graceful shutdown via click failed; escalating to force-kill…");
         } else {
             emit_log(
                 app,
@@ -555,24 +556,27 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         }
 
         // ── Step 2: wait for worker lock to clear (up to 30 s) ───────────────
-        let mut worker_gone = false;
-        for i in 0..60 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if !lock.exists() {
-                emit_log(
-                    app,
-                    pier_path,
-                    &format!(
-                        "[portmate] Process-based shutdown: worker exited after ~{}ms, waiting for launcher…",
-                        (i + 1) * 500
-                    ),
-                );
-                worker_gone = true;
-                break;
+        // If graceful shutdown failed, skip the wait and force-kill immediately
+        let mut worker_gone = !graceful_ok; // Start as true if we're force-killing
+        if graceful_ok {
+            for i in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if !lock.exists() {
+                    emit_log(
+                        app,
+                        pier_path,
+                        &format!(
+                            "[portmate] Process-based shutdown: worker exited after ~{}ms, waiting for launcher…",
+                            (i + 1) * 500
+                        ),
+                    );
+                    worker_gone = true;
+                    break;
+                }
             }
         }
 
-        if !worker_gone {
+        if !worker_gone && graceful_ok {
             emit_log(
                 app,
                 pier_path,
@@ -600,15 +604,24 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         }
 
         // ── Step 4: escalate if any process is still alive ───────────────────
-        if !all_gone {
-            emit_log(
-                app,
-                pier_path,
-                &format!(
-                    "[portmate] Process-based shutdown: processes still alive after {}s — force-killing…",
-                    10
-                ),
-            );
+        // Note: if graceful shutdown failed, we force-kill regardless of wait result
+        if !all_gone || !graceful_ok {
+            if !all_gone {
+                emit_log(
+                    app,
+                    pier_path,
+                    &format!(
+                        "[portmate] Process-based shutdown: processes still alive after {}s — force-killing…",
+                        10
+                    ),
+                );
+            } else if !graceful_ok {
+                emit_log(
+                    app,
+                    pier_path,
+                    "[portmate] Graceful shutdown failed; force-killing to ensure clean state…",
+                );
+            }
 
             let alive_pids = find_urbit_process_pids(pier_path);
             if !alive_pids.is_empty() {
@@ -714,6 +727,17 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                     "[portmate] Forcibly removing stale lock file…",
                 );
                 let _ = std::fs::remove_file(&lock);
+            }
+
+            // Also try removing .vere.lock if it exists
+            let vere_lock = std::path::Path::new(pier_path).join(".vere.lock");
+            if vere_lock.exists() {
+                emit_log(
+                    app,
+                    pier_path,
+                    "[portmate] Forcibly removing stale .vere.lock file…",
+                );
+                let _ = std::fs::remove_file(&vere_lock);
             }
         }
     }
@@ -1024,9 +1048,26 @@ fn run_roll_preflight_cleanup(pier_path: &str, app: &AppHandle) {
 
     #[cfg(unix)]
     {
-        let _ = std::process::Command::new("pkill")
+        let output = std::process::Command::new("pkill")
             .args(["-9", "-f", pier_path])
             .output();
+        match output {
+            Ok(status) => {
+                if status.status.success() {
+                    let stdout = String::from_utf8_lossy(&status.stdout);
+                    let stderr = String::from_utf8_lossy(&status.stderr);
+                    if !stderr.is_empty() {
+                        emit_log(app, pier_path, &format!("[portmate] pkill output: {}", stderr.trim()));
+                    }
+                } else {
+                    // pkill with -9 typically returns non-zero when no process matches, which is OK
+                    emit_log(app, pier_path, "[portmate] pkill: no matching processes (ok)");
+                }
+            }
+            Err(e) => {
+                emit_log(app, pier_path, &format!("[portmate] pkill failed: {}", e));
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -1047,9 +1088,12 @@ fn run_roll_preflight_cleanup(pier_path: &str, app: &AppHandle) {
             pier_path.replace('\'', "''"),
             pier_name.replace('\'', "''")
         );
-        let _ = std::process::Command::new("powershell")
+        let output = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", &script])
             .output();
+        if let Err(e) = output {
+            emit_log(app, pier_path, &format!("[portmate] taskkill failed: {}", e));
+        }
     }
 
     let lock_candidates = [
@@ -1059,8 +1103,24 @@ fn run_roll_preflight_cleanup(pier_path: &str, app: &AppHandle) {
 
     for lock in lock_candidates {
         if lock.exists() {
-            let _ = std::fs::remove_file(&lock);
+            match std::fs::remove_file(&lock) {
+                Ok(()) => {
+                    emit_log(app, pier_path, &format!("[portmate] Removed stale lock: {}", lock.display()));
+                }
+                Err(e) => {
+                    emit_log(app, pier_path, &format!("[portmate] Failed to remove lock {}: {}", lock.display(), e));
+                }
+            }
         }
+    }
+
+    // Extra safety: verify no urbit processes are still alive
+    if any_urbit_process_alive(pier_path) {
+        emit_log(
+            app,
+            pier_path,
+            "[portmate] WARNING: urbit process(es) still detected after preflight cleanup!",
+        );
     }
 }
 

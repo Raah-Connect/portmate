@@ -14,11 +14,27 @@ pub fn stop_ship_graceful(pier_path: &str, app: &AppHandle) -> Result<(), String
         .output()
         .map_err(|e| format!("failed to launch click: {e}"))?;
 
-    if output.status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Check for error patterns in output even if exit code is 0
+    let has_error = stderr.contains("bail") 
+        || stderr.contains("error") 
+        || stderr.contains("Error")
+        || stdout.contains("bail")
+        || stdout.contains("moor bail");
+
+    if output.status.success() && !has_error {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("click failed: {}", stderr))
+        let error_details = if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("exit status: {}", output.status)
+        };
+        Err(format!("click graceful shutdown failed: {}", error_details))
     }
 }
 
