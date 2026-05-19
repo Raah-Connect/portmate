@@ -9,6 +9,7 @@ use commands::boot::{
 };
 use commands::boot_existing::boot_existing;
 use commands::boot_key::boot_key;
+use commands::click_stop::kill_ship_by_pid;
 use commands::memory::{chop_ship, meld_ship, pack_ship, roll_ship};
 use commands::memory_sched::{
     clear_all_memory_schedules_for_ship, clear_memory_schedule, get_memory_schedule,
@@ -63,21 +64,9 @@ impl ShipState {
                                     pid, s.name
                                 );
 
-                                #[cfg(unix)]
-                                unsafe {
-                                    libc::kill(pid as i32, libc::SIGKILL);
-                                    libc::kill(-(pid as i32), libc::SIGKILL);
-                                }
+                                // Use centralized kill API
+                                let _ = kill_ship_by_pid(pid);
 
-                                #[cfg(windows)]
-                                {
-                                    use std::process::Command;
-                                    let _ = Command::new("taskkill")
-                                        .args(&["/PID", &pid.to_string(), "/F", "/T"])
-                                        .output();
-                                }
-
-                                std::thread::sleep(std::time::Duration::from_millis(800));
                                 let _ = std::fs::remove_file(&lock_file);
                             } else {
                                 eprintln!(

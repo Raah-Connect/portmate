@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::click_stop::stop_ship_graceful;
+use super::click_stop::{stop_ship_graceful, kill_ship_by_pid, kill_ships_by_pier_path, force_kill_child};
 use super::memory_sched::ensure_default_memory_schedules_for_ship;
 use crate::commands::ship_stats::refresh_ship_size;
 use crate::{ShipInfo, ShipState};
@@ -738,7 +738,7 @@ pub fn stop_ship(
             .is_none();
 
         if still_running {
-            let _ = child.kill();
+            let _ = force_kill_child(&mut child);
         }
     }
     drop(processes);
@@ -793,14 +793,18 @@ pub(crate) fn restart_ship_internal(
         .to_string();
 
     // Force-kill the process by PID, platform-appropriately
-    kill_ship_process(&ship_info, &pier_path);
+    if let Some(pid) = ship_info.pid {
+        let _ = kill_ship_by_pid(pid);
+    } else {
+        let _ = kill_ships_by_pier_path(&pier_path);
+    }
 
     // Also remove from our tracked process list if present
     {
         let mut processes = state.processes.lock().unwrap();
         if let Some(pos) = processes.iter().position(|(p, _)| p == &pier_path) {
             let (_, mut child) = processes.remove(pos);
-            let _ = child.kill();
+            let _ = force_kill_child(&mut child);
         }
     }
 
@@ -814,46 +818,6 @@ pub(crate) fn restart_ship_internal(
     boot_comet(ship_info.binary_path, pier_dir, ship_info.name, app, state)
 }
 
-/// Kill the OS-level process for a ship, cross-platform.
-fn kill_ship_process(ship_info: &ShipInfo, pier_path: &str) {
-    // Prefer killing by PID when we have one — works the same everywhere.
-    if let Some(pid) = ship_info.pid {
-        #[cfg(unix)]
-        {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-            std::thread::sleep(std::time::Duration::from_millis(800));
-        }
-        #[cfg(windows)]
-        {
-            // /F force-kills, /T also terminates child processes of that PID
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
-            std::thread::sleep(std::time::Duration::from_millis(800));
-        }
-    } else {
-        // Fallback: match by pier path in the process name
-        #[cfg(unix)]
-        {
-            let _ = Command::new("pkill").args(["-9", "-f", pier_path]).output();
-            std::thread::sleep(std::time::Duration::from_millis(800));
-        }
-        #[cfg(windows)]
-        {
-            // WMIC lets us kill by command-line substring when we have no PID
-            let _ = Command::new("wmic")
-                .args([
-                    "process",
-                    "where",
-                    &format!("CommandLine like '%{}%'", pier_path),
-                    "call",
-                    "terminate",
-                ])
-                .output();
-            std::thread::sleep(std::time::Duration::from_millis(800));
-        }
-    }
-}
 
 #[tauri::command]
 pub fn delete_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(), String> {
@@ -861,7 +825,7 @@ pub fn delete_ship(pier_path: String, state: State<'_, ShipState>) -> Result<(),
         let mut processes = state.processes.lock().unwrap();
         if let Some(pos) = processes.iter().position(|(p, _)| p == &pier_path) {
             let (_, mut child) = processes.remove(pos);
-            let _ = child.kill();
+            let _ = force_kill_child(&mut child);
         }
     }
     state

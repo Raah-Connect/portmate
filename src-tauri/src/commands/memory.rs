@@ -4,7 +4,7 @@ use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::boot::restart_ship_internal;
-use super::click_stop::stop_ship_graceful;
+use super::click_stop::{stop_ship_graceful, kill_ships_by_pier_path, force_kill_child};
 use super::memory_sched::{mark_schedule_running, record_schedule_result};
 use crate::ShipState;
 
@@ -641,7 +641,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 let mut processes = state.processes.lock().unwrap();
                 if let Some(pos) = processes.iter().position(|(p, _)| p == pier_path) {
                     let (_, mut child) = processes.remove(pos);
-                    let _ = child.kill();
+                    let _ = force_kill_child(&mut child);
                 }
             }
 
@@ -654,32 +654,10 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
 
-            // Windows: taskkill /F /T kills the target and all its children.
-            // Run it once for TERM-equivalent and once more as last resort.
-            // We use PowerShell to find PIDs by command-line then taskkill each,
-            // because taskkill /FI "COMMANDLINE like ..." is not reliable.
+            // Windows: use centralized kill API
             #[cfg(windows)]
             {
-                let pier_name = std::path::Path::new(pier_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                let script = format!(
-                    "Get-CimInstance Win32_Process \
-                     | Where-Object {{ \
-                         $_.ProcessId -ne $PID -and \
-                         $_.CommandLine -and \
-                         $_.Name -match '^(urbit|vere)(\\.exe)?$' -and \
-                         ($_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*') \
-                     }} \
-                     | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}",
-                    pier_path.replace('\'', "''"),
-                    pier_name.replace('\'', "''")
-                );
-                let _ = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &script])
-                    .output();
-                std::thread::sleep(std::time::Duration::from_secs(2));
+                let _ = kill_ships_by_pier_path(pier_path);
             }
 
             let remaining_pids = find_urbit_process_pids(pier_path);
@@ -728,7 +706,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         let mut processes = state.processes.lock().unwrap();
         if let Some(pos) = processes.iter().position(|(p, _)| p == pier_path) {
             let (_, mut child) = processes.remove(pos);
-            let _ = child.kill();
+            let _ = force_kill_child(&mut child);
         }
     }
     {
@@ -1022,35 +1000,8 @@ fn run_roll_preflight_cleanup(pier_path: &str, app: &AppHandle) {
         "[portmate] Roll preflight: final cleanup of processes and lock files…",
     );
 
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-9", "-f", pier_path])
-            .output();
-    }
-
-    #[cfg(windows)]
-    {
-        let pier_name = std::path::Path::new(pier_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        let script = format!(
-            "Get-CimInstance Win32_Process \
-             | Where-Object {{ \
-                 $_.ProcessId -ne $PID -and \
-                 $_.CommandLine -and \
-                 $_.Name -match '^(urbit|vere)(\\.exe)?$' -and \
-                 ($_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*') \
-             }} \
-             | ForEach-Object {{ taskkill /F /T /PID $_.ProcessId }}",
-            pier_path.replace('\'', "''"),
-            pier_name.replace('\'', "''")
-        );
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .output();
-    }
+    // Use centralized kill API
+    let _ = kill_ships_by_pier_path(pier_path);
 
     let lock_candidates = [
         std::path::Path::new(pier_path).join(".urb").join("lock"),
