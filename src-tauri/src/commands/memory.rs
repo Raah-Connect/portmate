@@ -411,7 +411,7 @@ fn run_online_pack_meld(
 fn find_urbit_process_pids(pier_path: &str) -> Vec<u32> {
     let self_pid = std::process::id().to_string();
     std::process::Command::new("ps")
-        .args(["-eo", "pid,comm,args"])
+        .args(["-eo", "pid,stat,comm,args"])
         .output()
         .map(|o| {
             if !o.status.success() {
@@ -427,14 +427,23 @@ fn find_urbit_process_pids(pier_path: &str) -> Vec<u32> {
                     }
                     let mut parts = trimmed.split_whitespace();
                     let pid = parts.next()?;
+                    let stat = parts.next()?;
                     let comm = parts.next()?;
                     let args = parts.collect::<Vec<_>>().join(" ");
+                    
                     if pid == self_pid {
                         return None;
                     }
+                    
+                    // Skip defunct/zombie processes (state starts with 'Z')
+                    if stat.starts_with('Z') {
+                        return None;
+                    }
+                    
                     if !(comm == "urbit" || comm == "vere") {
                         return None;
                     }
+                    
                     if args.contains(pier_path) {
                         pid.parse::<u32>().ok()
                     } else {
@@ -581,7 +590,8 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
         }
 
         // ── Step 3: wait for launcher + any other urbit process to also exit ──
-        let wait_loops = 20;
+        // For very active ships, give more time for graceful termination (30s instead of 10s)
+        let wait_loops = 60;
         let mut all_gone = false;
         for i in 0..wait_loops {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -606,7 +616,7 @@ fn stop_for_maintenance(pier_path: &str, app: &AppHandle, state: &State<'_, Ship
                 pier_path,
                 &format!(
                     "[portmate] Process-based shutdown: processes still alive after {}s — force-killing…",
-                    10
+                    30
                 ),
             );
 
